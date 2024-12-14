@@ -1,0 +1,3102 @@
+# file: bigquery_utils.py
+from google.cloud import bigquery
+import pandas as pd
+import logging
+
+# Configure logging
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+def initialize_bigquery_client(project_id=None):
+    """
+    Initialize the BigQuery client.
+    Args:
+        project_id (str): GCP Project ID.
+    Returns:
+        bigquery.Client: BigQuery client object.
+    """
+    try:
+        client = bigquery.Client(project=project_id)
+        logger.info(f"BigQuery client initialized with project: {client.project}")
+        return client
+    except Exception as e:
+        raise ValueError(f"Failed to initialize BigQuery client: {e}")
+
+def read_table(client, dataset_id, table_id, mode='all', sample_size=None):
+    """
+    Read a BigQuery table into a pandas DataFrame.
+    Args:
+        client (bigquery.Client): Initialized BigQuery client.
+        dataset_id (str): Dataset ID.
+        table_id (str): Table ID.
+        mode (str): 'all' for full data, 'sample' for limited rows.
+        sample_size (int): Number of rows to sample.
+    Returns:
+        pd.DataFrame: DataFrame with table data.
+    """
+    if not dataset_id or not table_id:
+        raise ValueError("Both dataset_id and table_id must be provided.")
+    
+    table_ref = f"{client.project}.{dataset_id}.{table_id}"
+    query = f"SELECT * FROM `{table_ref}`"
+    if mode == 'sample' and sample_size:
+        query += f" LIMIT {sample_size}"
+    
+    logger.info(f"Executing query: {query}")
+    try:
+        dataframe = client.query(query).to_dataframe()
+        logger.info(f"Loaded {dataframe.shape[0]} rows from {table_ref}.")
+        return dataframe
+    except Exception as e:
+        raise ValueError(f"Failed to query table {table_ref}: {e}")
+
+def read_table_in_batches(client, dataset_id, table_id, batch_size=10000):
+    """
+    Read a BigQuery table in batches.
+    Args:
+        client (bigquery.Client): Initialized BigQuery client.
+        dataset_id (str): Dataset ID.
+        table_id (str): Table ID.
+        batch_size (int): Number of rows per batch.
+    Yields:
+        pd.DataFrame: DataFrame batch.
+    """
+    table_ref = f"{client.project}.{dataset_id}.{table_id}"
+    query = f"SELECT * FROM `{table_ref}`"
+    logger.info(f"Fetching total row count for {table_ref}.")
+    
+    total_rows = client.query(query).result().total_rows
+    logger.info(f"Table {table_ref} contains {total_rows} rows.")
+    
+    for start_index in range(0, total_rows, batch_size):
+        batch_query = f"{query} LIMIT {batch_size} OFFSET {start_index}"
+        logger.info(f"Fetching rows {start_index} to {start_index + batch_size - 1}.")
+        try:
+            yield client.query(batch_query).to_dataframe()
+        except Exception as e:
+            logger.error(f"Failed to fetch batch starting at {start_index}: {e}")
+            raise ValueError(f"Batch fetch error: {e}")
+
+# file: file_utils.py
+import pandas as pd
+import pickle
+import json
+import os
+
+def read_file(file_path):
+    """
+    Read a file into a pandas DataFrame.
+    Args:
+        file_path (str): Path to the file.
+    Returns:
+        pd.DataFrame: DataFrame with file data.
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".txt" or ext == ".csv":
+        return pd.read_csv(file_path)
+    elif ext == ".xlsx":
+        return pd.read_excel(file_path)
+    elif ext == ".json":
+        with open(file_path, 'r') as f:
+            return pd.DataFrame(json.load(f))
+    elif ext == ".pkl":
+        with open(file_path, "rb") as f:
+            return pd.DataFrame(pickle.load(f))
+    else:
+        raise ValueError(f"Unsupported file extension: {ext}")
+
+def save_dataframe(df, file_path):
+    """
+    Save a DataFrame to a file.
+    Args:
+        df (pd.DataFrame): DataFrame to save.
+        file_path (str): Path to save the file.
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in [".csv", ".txt"]:
+        df.to_csv(file_path, index=False)
+    elif ext == ".json":
+        df.to_json(file_path, orient='records')
+    elif ext == ".pkl":
+        with open(file_path, "wb") as f:
+            pickle.dump(df.to_dict(), f, protocol=pickle.HIGHEST_PROTOCOL)
+    else:
+        raise ValueError(f"Unsupported file extension: {ext}")
+
+
+
+============================================================================================================
+
+import pandas as pd
+import numpy as np
+import os
+
+def generate_embeddings(
+    data: pd.DataFrame, 
+    id_columns: list, 
+    embedding_method: callable, 
+    embed_as_list: bool = False, 
+    save_path: str = None
+) -> pd.DataFrame:
+    """
+    Separates a DataFrame into IDs and features, generates embeddings for features,
+    and recombines IDs with embeddings. Optionally saves the resulting DataFrame.
+
+    Args:
+        data (pd.DataFrame): Input DataFrame with IDs and features.
+        id_columns (list): List of column names to treat as IDs.
+        embedding_method (callable): A function that generates embeddings from features.
+                                     Must take a DataFrame and return a NumPy array.
+        embed_as_list (bool): If True, embeddings will be stored as a list in a single column.
+        save_path (str): Path to save the resulting DataFrame. File format inferred from extension.
+
+    Returns:
+        pd.DataFrame: DataFrame with IDs and embedded features.
+    """
+    if not id_columns:
+        raise ValueError("id_columns must be provided as a non-empty list.")
+    if not callable(embedding_method):
+        raise ValueError("embedding_method must be a callable function.")
+    
+    # Separate IDs and features
+    ids = data[id_columns]
+    features = data.drop(columns=id_columns)
+
+    # Generate embeddings
+    embeddings = embedding_method(features)
+    if embeddings.shape[0] != features.shape[0]:
+        raise ValueError("Mismatch between number of rows in embeddings and features.")
+
+    # Handle embedding as list or separate columns
+    if embed_as_list:
+        # Combine embeddings into a single list column
+        embedding_column = [list(row) for row in embeddings]
+        ids['Embeddings'] = embedding_column
+        result = ids
+    else:
+        # Create DataFrame for embeddings with separate columns
+        embedding_df = pd.DataFrame(embeddings, columns=[f"EmbeddingDim_{i}" for i in range(embeddings.shape[1])])
+        result = pd.concat([ids.reset_index(drop=True), embedding_df], axis=1)
+    
+    # Save to file if save_path is provided
+    if save_path:
+        save_dataframe(result, save_path)
+
+    return result
+
+def save_dataframe(df: pd.DataFrame, save_path: str):
+    """
+    Saves a DataFrame to the specified file path. Format is inferred from the file extension.
+
+    Args:
+        df (pd.DataFrame): DataFrame to save.
+        save_path (str): Path to save the file. Supported formats: .csv, .json, .xlsx, .pkl.
+    """
+    ext = os.path.splitext(save_path)[1].lower()
+    if ext == ".csv":
+        df.to_csv(save_path, index=False)
+    elif ext == ".json":
+        df.to_json(save_path, orient='records')
+    elif ext == ".xlsx":
+        df.to_excel(save_path, index=False)
+    elif ext == ".pkl":
+        df.to_pickle(save_path)
+    else:
+        raise ValueError(f"Unsupported file extension: {ext}")
+
+# Example usage
+if __name__ == "__main__":
+    # Example DataFrame
+    data = pd.DataFrame({
+        'UserID': [1, 2, 3],
+        'Feature1': [0.5, 0.3, 0.8],
+        'Feature2': [0.1, 0.2, 0.7]
+    })
+
+    # Example embedding method (replace with your actual method)
+    def mock_embedding_method(features: pd.DataFrame) -> np.ndarray:
+        return np.random.rand(features.shape[0], 128)  # 128-dimensional embeddings
+
+    # Generate embeddings with separate columns and save to a CSV file
+    result_separate = generate_embeddings(
+        data, 
+        id_columns=['UserID'], 
+        embedding_method=mock_embedding_method, 
+        embed_as_list=False, 
+        save_path="embeddings_separate.csv"
+    )
+    print("Embeddings saved to 'embeddings_separate.csv'.")
+
+    # Generate embeddings as a single list column and save to a JSON file
+    result_list = generate_embeddings(
+        data, 
+        id_columns=['UserID'], 
+        embedding_method=mock_embedding_method, 
+        embed_as_list=True, 
+        save_path="embeddings_list.json"
+    )
+    print("Embeddings saved to 'embeddings_list.json'.")
+
+============================================================================================================
+
+
+
+
+=============================================================================================
+
+GPT Icon
+
+For more performant and scalable alternatives to PCA or t-SNE, consider using UMAP (Uniform Manifold Approximation and Projection) or FAISS (Facebook AI Similarity Search) for high-dimensional visualization or embedding analysis. Both are faster, especially on large datasets, and produce better results for certain structures.
+1. Using UMAP for Dimensionality Reduction
+
+UMAP is a state-of-the-art dimensionality reduction technique that is faster and often more effective than t-SNE for embedding visualization.
+Installation:
+
+pip install umap-learn
+
+Code Example:
+
+import umap
+import matplotlib.pyplot as plt
+
+# Reduce embeddings to 2D using UMAP
+umap_reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, n_components=2, random_state=42)
+embeddings_umap_2d = umap_reducer.fit_transform(embeddings_np)
+
+# Plot UMAP results
+plt.figure(figsize=(8, 6))
+plt.scatter(embeddings_umap_2d[:, 0], embeddings_umap_2d[:, 1], c=city_data.numpy(), cmap='viridis', alpha=0.8)
+plt.colorbar(label='City Index')
+plt.title('Latent Embeddings (UMAP Reduced)')
+plt.xlabel('UMAP Dim 1')
+plt.ylabel('UMAP Dim 2')
+plt.show()
+
+Advantages of UMAP:
+
+    Faster than t-SNE, especially for large datasets.
+    Maintains a good balance between preserving local and global structure.
+    Supports both supervised and unsupervised modes.
+
+2. Using FAISS for High-Dimensional Similarity Search
+
+If you want to perform similarity searches or visualize high-dimensional data quickly, FAISS by Facebook AI is a powerful library for nearest-neighbor searches in high-dimensional spaces.
+Installation:
+
+pip install faiss-cpu
+
+Code Example for FAISS Visualization:
+
+import faiss
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Convert embeddings to float32 for FAISS
+embeddings_faiss = embeddings_np.astype(np.float32)
+
+# Build FAISS index (FlatL2 for brute-force nearest neighbors)
+index = faiss.IndexFlatL2(embeddings_faiss.shape[1])
+index.add(embeddings_faiss)
+
+# Perform a similarity search (k-nearest neighbors)
+k = 5
+distances, indices = index.search(embeddings_faiss, k)
+
+# Example: Visualize neighbors for the first embedding
+query_idx = 0
+neighbors = indices[query_idx]
+
+print(f"Top {k} neighbors for sample {query_idx}: {neighbors}")
+print(f"Distances: {distances[query_idx]}")
+
+# Optional: Highlight neighbors in 2D using UMAP
+neighbors_2d = embeddings_umap_2d[neighbors]
+plt.figure(figsize=(8, 6))
+plt.scatter(embeddings_umap_2d[:, 0], embeddings_umap_2d[:, 1], alpha=0.2, label="All Data")
+plt.scatter(neighbors_2d[:, 0], neighbors_2d[:, 1], color='red', label="Neighbors")
+plt.scatter(embeddings_umap_2d[query_idx, 0], embeddings_umap_2d[query_idx, 1], color='blue', label="Query")
+plt.legend()
+plt.title(f"UMAP Visualization of Neighbors for Sample {query_idx}")
+plt.show()
+
+Advantages of FAISS:
+
+    Optimized for fast, large-scale similarity search.
+    Useful for tasks like clustering, nearest-neighbor retrieval, and high-dimensional visualization.
+
+Comparison Between UMAP and FAISS
+Feature	UMAP	FAISS
+Purpose	Dimensionality reduction for visualization	High-dimensional similarity search
+Performance	Very fast, suitable for large datasets	Extremely fast for nearest-neighbor search
+Interpretability	Produces interpretable 2D/3D visualizations	Outputs neighbors; visualization is indirect
+Scalability	Scales to millions of samples	Scales to millions of samples
+3. Combined Approach: Use UMAP with FAISS
+
+You can combine UMAP for dimensionality reduction and FAISS for similarity searches in the reduced space. This approach is efficient for tasks requiring both visualization and similarity-based exploration.
+
+# Use FAISS for neighbor search in high dimensions
+distances, indices = index.search(embeddings_faiss, k=5)
+
+# Map neighbors to UMAP 2D space
+query_idx = 0  # Example query index
+neighbors_2d = embeddings_umap_2d[indices[query_idx]]
+
+# Visualize query and its neighbors in 2D
+plt.figure(figsize=(8, 6))
+plt.scatter(embeddings_umap_2d[:, 0], embeddings_umap_2d[:, 1], alpha=0.3, label='All Data')
+plt.scatter(neighbors_2d[:, 0], neighbors_2d[:, 1], color='red', label='Neighbors')
+plt.scatter(embeddings_umap_2d[query_idx, 0], embeddings_umap_2d[query_idx, 1], color='blue', label='Query Point')
+plt.legend()
+plt.title(f"UMAP + FAISS Visualization for Query {query_idx}")
+plt.show()
+
+
+
+
+==========================================================================================
+
+        
+        
+==========================================================================================        
+
+# Function to Generate Embeddings from DataFrame
+def get_embeddings_from_dataframe(
+    df: pd.DataFrame,
+    tf: TensorFrame,
+    model: TabularNN,
+    format: str,
+    device: torch.device,
+) -> pd.Series:
+    model.eval()
+    with torch.no_grad():
+        embeddings = model(tf.to(device), return_embeddings=True)
+        row_embeddings = F.normalize(embeddings.reshape(embeddings.shape[0], -1), p=2, dim=1)
+
+    if format == "get_np":
+        return row_embeddings.detach().cpu().numpy()
+    elif format == "get_pd":
+        return pd.Series(row_embeddings.detach().cpu().numpy().tolist(), index=df.index, name="row_embeddings")
+
+# Function to Reorder DataFrame Columns
+def reorder_columns(df: pd.DataFrame, col_dict: Dict[str, List[str]]) -> pd.DataFrame:
+    ordered_columns = [col for key in col_dict for col in col_dict[key]]
+    return df[ordered_columns]
+
+
+import pickle
+import pandas as pd
+import numpy as np
+
+
+def get_feature_embeddings(
+    df: pd.DataFrame,
+    embeddings: np.ndarray,
+    selected_features: list,
+    n: int,
+    save_path: str,
+) -> pd.DataFrame:
+    """
+    Extracts specific feature embeddings from a NumPy array, saves them to a pickle file, 
+    and returns a DataFrame with both flattened and original vector formats.
+
+    Args:
+        df (pd.DataFrame): DataFrame with column names aligned with embeddings.
+        embeddings (np.ndarray): Array of shape (rows, columns * channels), where embeddings are flattened.
+        selected_features (list): List of feature names to extract.
+        n (int): Number of channels (dimensions) per feature.
+        save_path (str): Path to save the embeddings as a pickle file.
+
+    Returns:
+        pd.DataFrame: DataFrame containing flattened embeddings and original vectors for the selected features.
+    """
+    # Validate selected features
+    missing_features = [feature for feature in selected_features if feature not in df.columns]
+    if missing_features:
+        raise ValueError(f"Some selected features are not in the DataFrame columns: {missing_features}")
+
+    # Map feature names to their indices
+    feature_indices = {feature: i for i, feature in enumerate(df.columns)}
+
+    # Extract indices for the selected features
+    selected_indices = [
+        range(feature_indices[feature] * n, (feature_indices[feature] + 1) * n)
+        for feature in selected_features
+    ]
+    # Flatten selected indices
+    selected_indices = [idx for sublist in selected_indices for idx in sublist]
+
+    # Extract embeddings for the selected features
+    selected_embeddings = embeddings[:, selected_indices]  # Shape: (rows, len(selected_features) * n)
+
+    # Save the selected embeddings to a pickle file
+    with open(save_path, 'wb') as f:
+        pickle.dump(selected_embeddings, f)
+
+    # Create flattened column names dynamically
+    flat_column_names = [
+        f"{feature}_dim{dim}"
+        for feature in selected_features
+        for dim in range(n)
+    ]
+
+    # Create a DataFrame for flattened embeddings
+    selected_embeddings_df = pd.DataFrame(selected_embeddings, columns=flat_column_names)
+
+    # Add original vectors for each feature
+    for feature in selected_features:
+        feature_start_idx = feature_indices[feature] * n
+        feature_end_idx = feature_start_idx + n
+        selected_embeddings_df[f"{feature}_vector"] = list(embeddings[:, feature_start_idx:feature_end_idx])
+
+    return selected_embeddings_df
+
+
+
+
+selected_embeddings_df = get_feature_embeddings(
+    df=df,
+    embeddings=embeddings,
+    selected_features=selected_features,
+    n=n,
+    save_path=save_path
+)
+
+# View the resulting DataFrame
+print(selected_embeddings_df)
+
+
+import torch
+import torch.nn as nn
+
+class DimensionalityReducer(nn.Module):
+    """
+    A dimensionality reduction module with a linear projection layer and dropout regularization.
+    
+    Args:
+        input_dim (int): Dimension of the input embeddings.
+        reduced_dim (int): Dimension to reduce the embeddings to.
+        dropout_prob (float): Probability of dropping out neurons during training.
+    """
+    def __init__(self, input_dim, reduced_dim, dropout_prob=0.1):
+        super().__init__()
+        self.projection = nn.Linear(input_dim, reduced_dim)
+        self.dropout = nn.Dropout(p=dropout_prob)  # Dropout for regularization
+
+    def forward(self, x):
+        """
+        Applies the linear projection followed by dropout.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape [batch_size, input_dim].
+        
+        Returns:
+            torch.Tensor: Output tensor of shape [batch_size, reduced_dim].
+        """
+        x = self.projection(x)
+        x = self.dropout(x)
+        return x
+
+# Example usage
+input_dim = 768
+reduced_dim = 64
+dropout_prob = 0.2  # 20% dropout
+
+reducer = DimensionalityReducer(input_dim, reduced_dim, dropout_prob)
+
+# Dummy transformer embedding
+embedding = torch.randn(1, input_dim)  # Batch size 1, 768 dimensions
+reduced_embedding = reducer(embedding)
+
+print(reduced_embedding.shape)  # Output: torch.Size([1, 64])
+
+
+
+class DimensionalityReducerWithBatchNorm(nn.Module):
+    def __init__(self, input_dim, reduced_dim, dropout_prob=0.1):
+        super().__init__()
+        self.projection = nn.Linear(input_dim, reduced_dim)
+        self.batch_norm = nn.BatchNorm1d(reduced_dim)  # Batch normalization
+        self.dropout = nn.Dropout(p=dropout_prob)
+
+    def forward(self, x):
+        x = self.projection(x)
+        x = self.batch_norm(x)
+        x = self.dropout(x)
+        return x
+
+# Example usage
+reducer_with_bn = DimensionalityReducerWithBatchNorm(input_dim, reduced_dim, dropout_prob=0.2)
+
+
+import pickle
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class DimensionalityReducer(nn.Module):
+    """
+    Dimensionality reduction with a linear projection layer and dropout regularization.
+    
+    Args:
+        input_dim (int): Dimension of the input embeddings.
+        reduced_dim (int): Dimension to reduce the embeddings to.
+        dropout_prob (float): Probability of dropping out neurons during training.
+    """
+    def __init__(self, input_dim, reduced_dim, dropout_prob=0.1):
+        super().__init__()
+        self.projection = nn.Linear(input_dim, reduced_dim)
+        self.dropout = nn.Dropout(p=dropout_prob)
+
+    def forward(self, x):
+        x = self.projection(x)
+        x = self.dropout(x)
+        return x
+
+
+def get_embeddings_from_dataframe(
+    df: pd.DataFrame,
+    tf: torch.Tensor,
+    model: nn.Module,
+    reducer: DimensionalityReducer,
+    format: str,
+    device: torch.device,
+) -> pd.Series:
+    """
+    Converts a DataFrame into embeddings, applies dimensionality reduction, and returns results.
+    
+    Args:
+        df (pd.DataFrame): Input DataFrame with feature names aligned to embeddings.
+        tf (torch.Tensor): Tensor representation of the DataFrame.
+        model (nn.Module): Trained model for generating embeddings.
+        reducer (DimensionalityReducer): Dimensionality reduction module.
+        format (str): Output format, either 'get_np' or 'get_pd'.
+        device (torch.device): Device to run the model and reducer on.
+    
+    Returns:
+        pd.Series: Series with flattened, normalized, and reduced embeddings.
+    """
+    model.eval()
+    reducer.eval()
+
+    # Generate embeddings using the model
+    with torch.no_grad():
+        embeddings = model(tf.to(device), return_embeddings=True)
+        reduced_embeddings = reducer(embeddings)
+        reduced_embeddings = F.normalize(reduced_embeddings, p=2, dim=1)  # L2 normalization
+
+    if format == "get_np":
+        return reduced_embeddings.detach().cpu().numpy()
+    elif format == "get_pd":
+        return pd.Series(reduced_embeddings.detach().cpu().numpy().tolist(), index=df.index, name="row_embeddings")
+
+
+def get_feature_embeddings(
+    df: pd.DataFrame,
+    embeddings: np.ndarray,
+    selected_features: list,
+    n: int,
+    save_path: str,
+) -> pd.DataFrame:
+    """
+    Extracts embeddings for selected features, saves them to a pickle file, and returns a DataFrame.
+    
+    Args:
+        df (pd.DataFrame): DataFrame with column names aligned with embeddings.
+        embeddings (np.ndarray): Flattened embeddings.
+        selected_features (list): List of feature names to extract.
+        n (int): Number of dimensions (channels) per feature.
+        save_path (str): Path to save the embeddings as a pickle file.
+    
+    Returns:
+        pd.DataFrame: DataFrame containing flattened and vector embeddings for selected features.
+    """
+    # Map feature names to their indices
+    feature_indices = {feature: i for i, feature in enumerate(df.columns)}
+
+    # Validate selected features
+    missing_features = [feature for feature in selected_features if feature not in df.columns]
+    if missing_features:
+        raise ValueError(f"Some selected features are not in the DataFrame columns: {missing_features}")
+
+    # Extract indices for the selected features
+    selected_indices = [
+        range(feature_indices[feature] * n, (feature_indices[feature] + 1) * n)
+        for feature in selected_features
+    ]
+    selected_indices = [idx for sublist in selected_indices for idx in sublist]
+
+    # Extract embeddings for selected indices
+    selected_embeddings = embeddings[:, selected_indices]
+
+    # Save the selected embeddings
+    with open(save_path, 'wb') as f:
+        pickle.dump(selected_embeddings, f)
+
+    # Create column names dynamically for flattened vectors
+    flat_column_names = [
+        f"{feature}_dim{dim}"
+        for feature in selected_features
+        for dim in range(n)
+    ]
+
+    # Create a DataFrame for flattened embeddings
+    selected_embeddings_df = pd.DataFrame(selected_embeddings, columns=flat_column_names)
+
+    # Add original vectors for each feature
+    for feature in selected_features:
+        feature_start_idx = feature_indices[feature] * n
+        feature_end_idx = feature_start_idx + n
+        selected_embeddings_df[f"{feature}_vector"] = list(embeddings[:, feature_start_idx:feature_end_idx])
+
+    return selected_embeddings_df
+
+
+def reorder_columns(df: pd.DataFrame, col_dict: dict) -> pd.DataFrame:
+    """
+    Reorders DataFrame columns based on the provided column dictionary.
+    
+    Args:
+        df (pd.DataFrame): DataFrame to reorder.
+        col_dict (dict): Dictionary defining column groups and their order.
+    
+    Returns:
+        pd.DataFrame: Reordered DataFrame.
+    """
+    ordered_columns = [col for key in col_dict for col in col_dict[key]]
+    return df[ordered_columns]
+
+
+generate embeddings with dim red
+
+# Mock DataFrame and tensor
+df = pd.DataFrame({
+    'UserName': ['Alice', 'Bob', 'Charlie'],
+    'InterestRate': [3.5, 4.2, 5.1],
+    'LoanPurpose': ['Home', 'Car', 'Education'],
+    'DueDate': ['2023-01-01', '2023-02-15', '2023-03-10'],
+})
+tf = torch.randn(3, 768)  # Mock tensor (batch_size=3, input_dim=768)
+
+# Initialize model and reducer
+model = TabularNN(channels=128, out_channels=64, num_layers=2, col_stats={}, col_names_dict={})
+reducer = DimensionalityReducer(input_dim=768, reduced_dim=64, dropout_prob=0.2)
+
+# Device setup
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Generate reduced embeddings
+embeddings = get_embeddings_from_dataframe(df, tf, model, reducer, format="get_pd", device=device)
+print(embeddings)
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TabularNN(nn.Module):
+    """
+    TabularNN model with options to extract raw, convoluted, and pooled embeddings.
+    
+    Args:
+        channels (int): Input/hidden channel dimensionality.
+        out_channels (int): Output dimensionality.
+        num_layers (int): Number of convolution layers.
+        col_stats (dict): Column statistics for feature encoders.
+        col_names_dict (dict): Column names grouped by feature types.
+    """
+    def __init__(
+        self,
+        channels: int,
+        out_channels: int,
+        num_layers: int,
+        col_stats: dict,
+        col_names_dict: dict,
+    ):
+        super().__init__()
+        self.encoder = StypeWiseFeatureEncoder(
+            out_channels=channels,
+            col_stats=col_stats,
+            col_names_dict=col_names_dict,
+            stype_encoder_dict={
+                stype.categorical: EmbeddingEncoder(),
+                stype.numerical: LinearEncoder(),
+                text_stype.parent: LinearEmbeddingEncoder(),
+                stype.timestamp: TimestampEncoder(),
+            },
+        )
+        self.convs = nn.ModuleList([SelfAttentionConv(channels) for _ in range(num_layers)])
+        self.decoder = MeanDecoder(channels, out_channels)
+
+    def forward(self, tf: torch.Tensor, return_type: str = "pooled"):
+        """
+        Forward pass with options to extract different embedding types.
+        
+        Args:
+            tf (torch.Tensor): TensorFrame input.
+            return_type (str): Type of embedding to return:
+                - 'raw': Raw embeddings from the encoder.
+                - 'convoluted': Embeddings after convolution layers.
+                - 'pooled': Pooled embeddings after mean pooling.
+        
+        Returns:
+            torch.Tensor: Embeddings of the specified type.
+        """
+        raw_embeddings, _ = self.encoder(tf)  # Raw embeddings [batch_size, num_cols, channels]
+        
+        if return_type == "raw":
+            return raw_embeddings
+        
+        x = raw_embeddings
+        for conv in self.convs:
+            x = conv(x)  # Convoluted embeddings
+        
+        if return_type == "convoluted":
+            return x
+        
+        pooled_embeddings = self.decoder(x)  # Pooled embeddings
+        return pooled_embeddings
+        
+        
+        
+        
+       UMAP HDBSCAN
+       
+       
+       import umap
+import hdbscan
+import matplotlib.pyplot as plt
+import pandas as pd
+
+def visualize_and_cluster(embeddings: torch.Tensor, labels=None, n_neighbors=15, min_cluster_size=10):
+    """
+    Visualizes embeddings using UMAP and clusters them using HDBSCAN.
+    
+    Args:
+        embeddings (torch.Tensor): Embeddings to reduce and cluster.
+        labels (list or np.array, optional): Labels for coloring in visualization.
+        n_neighbors (int): UMAP parameter for local neighborhood size.
+        min_cluster_size (int): HDBSCAN parameter for the smallest cluster size.
+    
+    Returns:
+        hdbscan.HDBSCAN: Trained HDBSCAN model.
+    """
+    # Convert embeddings to NumPy for UMAP and HDBSCAN
+    embeddings_np = embeddings.detach().cpu().numpy()
+    
+    # Dimensionality reduction with UMAP
+    reducer = umap.UMAP(n_neighbors=n_neighbors, min_dist=0.1, n_components=2, random_state=42)
+    reduced_embeddings = reducer.fit_transform(embeddings_np)
+    
+    # Clustering with HDBSCAN
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size, gen_min_span_tree=True)
+    cluster_labels = clusterer.fit_predict(reduced_embeddings)
+    
+    # Visualization
+    plt.figure(figsize=(10, 8))
+    plt.scatter(reduced_embeddings[:, 0], reduced_embeddings[:, 1], c=cluster_labels, cmap='Spectral', s=10)
+    plt.colorbar(label='Cluster Label')
+    plt.title('UMAP Projection with HDBSCAN Clustering')
+    plt.xlabel('UMAP Dimension 1')
+    plt.ylabel('UMAP Dimension 2')
+    plt.show()
+
+    return clusterer
+
+# Example Usage
+# Assuming embeddings (torch.Tensor) is from the TabularNN model
+embeddings = torch.randn(100, 128)  # Mock 128-d embeddings for 100 samples
+clusterer = visualize_and_cluster(embeddings, n_neighbors=15, min_cluster_size=10)
+
+
+
+Considerations
+
+While there are clear advantages, using autoencoders for embedding tabular data also comes with challenges:
+
+    Complexity and Computational Cost:
+        Training autoencoders can be computationally expensive, especially for large datasets or complex architectures.
+
+    Data Preprocessing:
+        Proper preprocessing for mixed data types (e.g., encoding dates, text embeddings, or scaling numerical data) is crucial and can add complexity.
+
+    Interpretability:
+        Autoencoder embeddings are often less interpretable compared to manual feature engineering.
+
+    Overfitting Risk:
+        Without a downstream task to validate generalization, autoencoders might overfit to the training data.
+
+    Alternative Techniques:
+        Simpler techniques like PCA or t-SNE might suffice for dimensionality reduction and visualization without requiring the complexity of an autoencoder.
+
+When Should You Use Autoencoders?
+
+    You have complex relationships between features that simpler methods can't capture.
+    You want to combine multiple data types (e.g., text, dates, numerical) into a unified embedding.
+    You are interested in exploratory analysis of the latent space.
+    The data is large and noisy, and you want a robust representation.
+
+Would you like a code example of how to preprocess such data for an autoencoder or how to design an autoencoder architecture for mixed data types?
+You said:
+Yes. With no downstream task in mind and assume that I have numerical, categorical, text (short text only like cities names) and dates.
+ChatGPT said:
+GPT Icon
+
+Below is an example of how to preprocess a mixed-type dataset and train an autoencoder for embedding the data. The architecture is designed to handle numerical, categorical, text (short names), and dates. For simplicity, we'll assume you have a DataFrame and will preprocess it appropriately.
+Steps in the Code
+
+    Preprocess the Data:
+        Normalize numerical columns.
+        One-hot encode or use embeddings for categorical data.
+        Convert text (e.g., city names) to embeddings using a simple embedding layer.
+        Encode dates into meaningful numerical features (e.g., day, month, year, weekday).
+
+    Build an Autoencoder:
+        Combine processed features into a single input layer.
+        Create a neural network encoder-decoder structure for reconstruction.
+
+    Train the Autoencoder:
+        Use the reconstruction loss to learn the embeddings.
+
+    Extract the Latent Representations:
+        Use the encoder part of the model to generate embeddings.
+
+Code Implementation
+
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense, Embedding, Flatten, Concatenate
+from tensorflow.keras.utils import to_categorical
+
+# Sample DataFrame
+data = pd.DataFrame({
+    'Numerical': [1.2, 3.4, 5.6, 7.8],
+    'Categorical': ['A', 'B', 'A', 'C'],
+    'City': ['Paris', 'London', 'Paris', 'Berlin'],
+    'Date': ['2023-01-01', '2023-02-15', '2023-03-10', '2023-04-20']
+})
+
+# ----------- Preprocessing -----------
+
+# Numerical columns
+numerical_cols = ['Numerical']
+scaler = MinMaxScaler()
+numerical_data = scaler.fit_transform(data[numerical_cols])
+
+# Categorical columns
+categorical_cols = ['Categorical']
+encoder = OneHotEncoder(sparse=False)
+categorical_data = encoder.fit_transform(data[categorical_cols])
+
+# Text (short names like cities)
+unique_cities = data['City'].unique()
+city_to_idx = {city: idx for idx, city in enumerate(unique_cities)}
+data['City_idx'] = data['City'].map(city_to_idx)
+
+city_embedding_dim = 4  # Arbitrary dimension for city embeddings
+city_data = data['City_idx'].values
+
+# Date columns
+data['Date'] = pd.to_datetime(data['Date'])
+data['Day'] = data['Date'].dt.day
+data['Month'] = data['Date'].dt.month
+
+You said:
+Let's do this in pytorch not keras
+ChatGPT said:
+GPT Icon
+
+Here’s how you can preprocess the mixed-type data and build an autoencoder in PyTorch:
+Steps
+
+    Preprocess the Data:
+        Scale numerical data using MinMaxScaler.
+        One-hot encode categorical data using pandas.get_dummies.
+        Map text data (city names) to indices and use embeddings.
+        Extract meaningful features from dates (day, month, etc.).
+
+    Build the Autoencoder:
+        Use torch.nn to define an encoder-decoder architecture.
+        Combine embeddings and preprocessed numerical/categorical/date features.
+
+    Train the Autoencoder:
+        Use Mean Squared Error (MSE) as the reconstruction loss.
+
+    Extract Embeddings:
+        Use the encoder to generate embeddings.
+
+Code Implementation
+
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.preprocessing import MinMaxScaler
+
+# ----------- Sample Data -----------
+data = pd.DataFrame({
+    'Numerical': [1.2, 3.4, 5.6, 7.8],
+    'Categorical': ['A', 'B', 'A', 'C'],
+    'City': ['Paris', 'London', 'Paris', 'Berlin'],
+    'Date': ['2023-01-01', '2023-02-15', '2023-03-10', '2023-04-20']
+})
+
+# ----------- Preprocessing -----------
+
+# 1. Numerical Columns
+numerical_cols = ['Numerical']
+scaler = MinMaxScaler()
+numerical_data = scaler.fit_transform(data[numerical_cols])
+numerical_data = torch.tensor(numerical_data, dtype=torch.float32)
+
+# 2. Categorical Columns
+categorical_cols = ['Categorical']
+data['Categorical_idx'] = pd.Categorical(data['Categorical']).codes
+categorical_data = torch.tensor(data['Categorical_idx'].values, dtype=torch.long)
+
+# 3. Text (City) Embeddings
+unique_cities = data['City'].unique()
+city_to_idx = {city: idx for idx, city in enumerate(unique_cities)}
+data['City_idx'] = data['City'].map(city_to_idx)
+city_data = torch.tensor(data['City_idx'].values, dtype=torch.long)
+city_embedding_dim = 4  # Dimension for city embeddings
+
+# 4. Date Features
+data['Date'] = pd.to_datetime(data['Date'])
+data['Day'] = data['Date'].dt.day
+data['Month'] = data['Date'].dt.month
+date_data = torch.tensor(data[['Day', 'Month']].values, dtype=torch.float32)
+
+# Combine all features into a single input tensor
+all_data = torch.cat([
+    numerical_data,
+    torch.nn.functional.one_hot(categorical_data, num_classes=len(data['Categorical'].unique())).float(),
+    date_data
+], dim=1)
+input_dim = all_data.shape[1] + city_embedding_dim
+
+# ----------- Autoencoder Model -----------
+
+class MixedDataAutoencoder(nn.Module):
+    def __init__(self, input_dim, city_vocab_size, city_embedding_dim, latent_dim=8):
+        super(MixedDataAutoencoder, self).__init__()
+        self.city_embedding = nn.Embedding(city_vocab_size, city_embedding_dim)
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 16),
+            nn.ReLU(),
+            nn.Linear(16, latent_dim)
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 16),
+            nn.ReLU(),
+            nn.Linear(16, input_dim)
+        )
+
+    def forward(self, x, city_indices):
+        city_embeds = self.city_embedding(city_indices)
+        x = torch.cat([x, city_embeds], dim=1)
+        latent = self.encoder(x)
+        reconstructed = self.decoder(latent)
+        return reconstructed, latent
+
+# Initialize model
+city_vocab_size = len(unique_cities)
+latent_dim = 8
+model = MixedDataAutoencoder(input_dim, city_vocab_size, city_embedding_dim, latent_dim)
+
+# ----------- Training -----------
+
+# Define optimizer and loss function
+optimizer = optim.Adam(model.parameters(), lr=0.01)
+criterion = nn.MSELoss()
+
+# Prepare data
+city_indices = city_data
+inputs = all_data
+
+# Training loop
+epochs = 100
+for epoch in range(epochs):
+    model.train()
+    optimizer.zero_grad()
+    
+    # Forward pass
+    reconstructed, latent = model(inputs, city_indices)
+    
+    # Compute loss
+    loss = criterion(reconstructed, inputs)
+    
+    # Backward pass
+    loss.backward()
+    optimizer.step()
+    
+    if (epoch + 1) % 10 == 0:
+        print(f"Epoch [{epoch + 1}/{epochs}], Loss: {loss.item():.4f}")
+
+# ----------- Extract Embeddings -----------
+model.eval()
+with torch.no_grad():
+    _, embeddings = model(inputs, city_indices)
+print("Latent Embeddings:\n", embeddings)
+
+Key Points
+
+    Embedding Layer for Cities:
+        We use an embedding layer for city names, which maps each city to a dense vector.
+
+    Date Features:
+        Extract day and month from the date and include them as numerical inputs.
+
+    Autoencoder:
+        The encoder compresses all mixed-type features into a smaller latent dimension (latent_dim).
+        The decoder reconstructs the original input for training.
+
+    Training:
+        Use Mean Squared Error (MSE) to minimize reconstruction error.
+
+    Extracting Embeddings:
+        The encoder’s output provides the learned embeddings.
+
+#
+A VAE introduces a probabilistic latent space, ensuring the latent variables follow a normal distribution. This encourages disentangled and interpretable embeddings.
+Key Additions:
+
+    Use a mean (mu) and log-variance (log_var) layer for the encoder.
+    Add a KL-divergence loss to encourage a normal distribution in the latent space.
+
+Implementation:
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+class VAE(nn.Module):
+    def __init__(self, input_dim, city_vocab_size, city_embedding_dim, latent_dim=8):
+        super(VAE, self).__init__()
+        self.city_embedding = nn.Embedding(city_vocab_size, city_embedding_dim)
+        self.encoder_fc = nn.Sequential(
+            nn.Linear(input_dim, 16),
+            nn.ReLU()
+        )
+        self.mu_layer = nn.Linear(16, latent_dim)
+        self.log_var_layer = nn.Linear(16, latent_dim)
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 16),
+            nn.ReLU(),
+            nn.Linear(16, input_dim)
+        )
+
+    def reparameterize(self, mu, log_var):
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, x, city_indices):
+        city_embeds = self.city_embedding(city_indices)
+        x = torch.cat([x, city_embeds], dim=1)
+        encoded = self.encoder_fc(x)
+        mu = self.mu_layer(encoded)
+        log_var = self.log_var_layer(encoded)
+        z = self.reparameterize(mu, log_var)
+        reconstructed = self.decoder(z)
+        return reconstructed, mu, log_var, z
+
+# Initialize model
+model = VAE(input_dim, city_vocab_size, city_embedding_dim, latent_dim)
+
+# ----------- Training -----------
+
+optimizer = optim.Adam(model.parameters(), lr=0.01)
+criterion = nn.MSELoss()
+
+# Training loop
+epochs = 100
+for epoch in range(epochs):
+    model.train()
+    optimizer.zero_grad()
+
+    reconstructed, mu, log_var, z = model(inputs, city_indices)
+
+    # Reconstruction loss
+    recon_loss = criterion(reconstructed, inputs)
+
+    # KL-divergence loss
+    kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp()) / inputs.shape[0]
+
+    # Combined loss
+    loss = recon_loss + kl_loss
+
+    # Backward pass
+    loss.backward()
+    optimizer.step()
+
+    if (epoch + 1) % 10 == 0:
+        print(f"Epoch [{epoch + 1}/{epochs}], Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f}")
+
+2. Feature-Specific Reconstruction Penalties
+
+To align specific latent dimensions with known input features, you can add penalties to the loss function. For example:
+
+    Penalize differences in reconstructed numerical values more heavily than categorical or date values.
+
+Implementation:
+
+# Custom loss function with feature-specific weights
+def weighted_loss(reconstructed, inputs, weights):
+    # Split reconstructed inputs to align with specific feature groups
+    num_features = numerical_data.shape[1]
+    cat_features = categorical_data.shape[1]
+    date_features = date_data.shape[1]
+
+    # Separate reconstructed components
+    reconstructed_num = reconstructed[:, :num_features]
+    reconstructed_cat = reconstructed[:, num_features:num_features + cat_features]
+    reconstructed_date = reconstructed[:, -date_features:]
+
+    # Separate input components
+    inputs_num = inputs[:, :num_features]
+    inputs_cat = inputs[:, num_features:num_features + cat_features]
+    inputs_date = inputs[:, -date_features:]
+
+    # Compute weighted losses
+    num_loss = weights['num'] * criterion(reconstructed_num, inputs_num)
+    cat_loss = weights['cat'] * criterion(reconstructed_cat, inputs_cat)
+    date_loss = weights['date'] * criterion(reconstructed_date, inputs_date)
+
+    return num_loss + cat_loss + date_loss
+
+# Define weights for each feature type
+feature_weights = {'num': 1.0, 'cat': 0.5, 'date': 0.8}
+
+# Training loop with weighted loss
+for epoch in range(epochs):
+    model.train()
+    optimizer.zero_grad()
+
+    reconstructed, mu, log_var, z = model(inputs, city_indices)
+
+    # Reconstruction loss with weights
+    recon_loss = weighted_loss(reconstructed, inputs, feature_weights)
+
+    # KL-divergence loss
+    kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp()) / inputs.shape[0]
+
+    # Combined loss
+    loss = recon_loss + kl_loss
+
+    # Backward pass
+    loss.backward()
+    optimizer.step()
+
+    if (epoch + 1) % 10 == 0:
+        print(f"Epoch [{epoch + 1}/{epochs}], Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f}")
+
+Key Points
+
+    VAEs:
+        Add a probabilistic latent space, encouraging disentangled embeddings.
+        KL-divergence ensures the latent space follows a normal distribution.
+
+    Feature-Specific Penalties:
+        Allow you to prioritize the reconstruction accuracy of specific features.
+        Useful if some features are more important or sensitive than others.
+
+Would you like to visualize the embeddings learned by this VAE or analyze their relationship to specific features?
+You said:
+yes
+ChatGPT said:
+GPT Icon
+Visualizing the Embeddings and Analyzing Their Relationship to Features
+
+After training the VAE with feature-specific penalties, you can extract the latent embeddings and visualize their structure. Additionally, you can explore how specific latent dimensions relate to the original features.
+1. Extracting and Visualizing Embeddings
+
+Extract the embeddings from the encoder and use dimensionality reduction techniques like PCA or t-SNE for visualization.
+Code Example:
+
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+
+# Switch the model to evaluation mode
+model.eval()
+
+# Extract latent embeddings
+with torch.no_grad():
+    _, _, _, embeddings = model(inputs, city_indices)
+
+# Convert embeddings to NumPy
+embeddings_np = embeddings.numpy()
+
+# Reduce embeddings to 2D using PCA
+pca = PCA(n_components=2)
+embeddings_2d = pca.fit_transform(embeddings_np)
+
+# Plot embeddings
+plt.figure(figsize=(8, 6))
+plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], c=city_data.numpy(), cmap='viridis', alpha=0.8)
+plt.colorbar(label='City Index')
+plt.title('Latent Embeddings (PCA Reduced)')
+plt.xlabel('PCA Dim 1')
+plt.ylabel('PCA Dim 2')
+plt.show()
+
+2. Analyzing Relationships Between Latent Dimensions and Features
+
+You can correlate latent dimensions with specific input features to see if any dimension aligns with a particular feature.
+Code Example:
+
+import pandas as pd
+
+# Create a DataFrame for analysis
+latent_df = pd.DataFrame(embeddings_np, columns=[f"Latent_Dim_{i}" for i in range(embeddings_np.shape[1])])
+original_features = pd.DataFrame(inputs.numpy(), columns=['Numerical', 'Cat_A', 'Cat_B', 'Cat_C', 'Day', 'Month'])
+
+# Combine latent dimensions and original features
+analysis_df = pd.concat([latent_df, original_features], axis=1)
+
+# Compute correlations
+correlation_matrix = analysis_df.corr()
+
+# Display correlations between latent dimensions and original features
+print("Correlation Matrix (Latent Dimensions vs Features):")
+print(correlation_matrix.loc[latent_df.columns, original_features.columns])
+
+# Optional: Visualize the correlation matrix
+import seaborn as sns
+plt.figure(figsize=(10, 8))
+sns.heatmap(correlation_matrix.loc[latent_df.columns, original_features.columns], annot=True, cmap='coolwarm')
+plt.title('Correlation between Latent Dimensions and Features')
+plt.show()
+
+3. Investigating Specific Latent Dimensions
+
+If a latent dimension shows strong correlation with a specific feature, plot their relationship to better understand the embedding.
+Code Example:
+
+# Plot specific latent dimension against a feature
+latent_dim_idx = 0  # Example: first latent dimension
+feature_name = 'Numerical'  # Replace with feature of interest
+
+plt.figure(figsize=(8, 6))
+plt.scatter(analysis_df[f"Latent_Dim_{latent_dim_idx}"], analysis_df[feature_name], alpha=0.8)
+plt.title(f"Latent Dimension {latent_dim_idx} vs {feature_name}")
+plt.xlabel(f"Latent_Dim_{latent_dim_idx}")
+plt.ylabel(feature_name)
+plt.show()
+
+Expected Insights
+
+    Embedding Clusters:
+        Visualizing the embeddings in 2D can show clustering based on categorical or text features (e.g., cities).
+
+    Correlations:
+        Strong correlations between latent dimensions and input features can suggest that certain embeddings encode specific features.
+
+    Interpretability:
+        Plotting relationships reveals whether specific latent dimensions align with meaningful properties of the data.
+
+Would you like help extending this for another visualization method, or to focus on disentangling specific dimensions further?
+You said:
+What about using something more performant than PCA or t-SNE
+ChatGPT said:
+GPT Icon
+
+For more performant and scalable alternatives to PCA or t-SNE, consider using UMAP (Uniform Manifold Approximation and Projection) or FAISS (Facebook AI Similarity Search) for high-dimensional visualization or embedding analysis. Both are faster, especially on large datasets, and produce better results for certain structures.
+1. Using UMAP for Dimensionality Reduction
+
+UMAP is a state-of-the-art dimensionality reduction technique that is faster and often more effective than t-SNE for embedding visualization.
+Installation:
+
+pip install umap-learn
+
+Code Example:
+
+import umap
+import matplotlib.pyplot as plt
+
+# Reduce embeddings to 2D using UMAP
+umap_reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, n_components=2, random_state=42)
+embeddings_umap_2d = umap_reducer.fit_transform(embeddings_np)
+
+# Plot UMAP results
+plt.figure(figsize=(8, 6))
+plt.scatter(embeddings_umap_2d[:, 0], embeddings_umap_2d[:, 1], c=city_data.numpy(), cmap='viridis', alpha=0.8)
+plt.colorbar(label='City Index')
+plt.title('Latent Embeddings (UMAP Reduced)')
+plt.xlabel('UMAP Dim 1')
+plt.ylabel('UMAP Dim 2')
+plt.show()
+
+Advantages of UMAP:
+
+    Faster than t-SNE, especially for large datasets.
+    Maintains a good balance between preserving local and global structure.
+    Supports both supervised and unsupervised modes.
+
+2. Using FAISS for High-Dimensional Similarity Search
+
+If you want to perform similarity searches or visualize high-dimensional data quickly, FAISS by Facebook AI is a powerful library for nearest-neighbor searches in high-dimensional spaces.
+Installation:
+
+pip install faiss-cpu
+
+Code Example for FAISS Visualization:
+
+import faiss
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Convert embeddings to float32 for FAISS
+embeddings_faiss = embeddings_np.astype(np.float32)
+
+# Build FAISS index (FlatL2 for brute-force nearest neighbors)
+index = faiss.IndexFlatL2(embeddings_faiss.shape[1])
+index.add(embeddings_faiss)
+
+# Perform a similarity search (k-nearest neighbors)
+k = 5
+distances, indices = index.search(embeddings_faiss, k)
+
+# Example: Visualize neighbors for the first embedding
+query_idx = 0
+neighbors = indices[query_idx]
+
+print(f"Top {k} neighbors for sample {query_idx}: {neighbors}")
+print(f"Distances: {distances[query_idx]}")
+
+# Optional: Highlight neighbors in 2D using UMAP
+neighbors_2d = embeddings_umap_2d[neighbors]
+plt.figure(figsize=(8, 6))
+plt.scatter(embeddings_umap_2d[:, 0], embeddings_umap_2d[:, 1], alpha=0.2, label="All Data")
+plt.scatter(neighbors_2d[:, 0], neighbors_2d[:, 1], color='red', label="Neighbors")
+plt.scatter(embeddings_umap_2d[query_idx, 0], embeddings_umap_2d[query_idx, 1], color='blue', label="Query")
+plt.legend()
+plt.title(f"UMAP Visualization of Neighbors for Sample {query_idx}")
+plt.show()
+
+Advantages of FAISS:
+
+    Optimized for fast, large-scale similarity search.
+    Useful for tasks like clustering, nearest-neighbor retrieval, and high-dimensional visualization.
+
+Comparison Between UMAP and FAISS
+Feature	UMAP	FAISS
+Purpose	Dimensionality reduction for visualization	High-dimensional similarity search
+Performance	Very fast, suitable for large datasets	Extremely fast for nearest-neighbor search
+Interpretability	Produces interpretable 2D/3D visualizations	Outputs neighbors; visualization is indirect
+Scalability	Scales to millions of samples	Scales to millions of samples
+3. Combined Approach: Use UMAP with FAISS
+
+You can combine UMAP for dimensionality reduction and FAISS for similarity searches in the reduced space. This approach is efficient for tasks requiring both visualization and similarity-based exploration.
+
+# Use FAISS for neighbor search in high dimensions
+distances, indices = index.search(embeddings_faiss, k=5)
+
+# Map neighbors to UMAP 2D space
+query_idx = 0  # Example query index
+neighbors_2d = embeddings_umap_2d[indices[query_idx]]
+
+# Visualize query and its neighbors in 2D
+plt.figure(figsize=(8, 6))
+plt.scatter(embeddings_umap_2d[:, 0], embeddings_umap_2d[:, 1], alpha=0.3, label='All Data')
+plt.scatter(neighbors_2d[:, 0], neighbors_2d[:, 1], color='red', label='Neighbors')
+plt.scatter(embeddings_umap_2d[query_idx, 0], embeddings_umap_2d[query_idx, 1], color='blue', label='Query Point')
+plt.legend()
+plt.title(f"UMAP + FAISS Visualization for Query {query_idx}")
+plt.show()
+
+Next Steps:
+
+    Would you like to further explore neighbor similarity metrics with FAISS?
+    Do you want to combine UMAP and FAISS for a specific clustering or search use case?
+
+You said:
+Let's go back to autoencoders. I have an embedidng module inspired by pytorch-frame. Here it is:
+
+ChatGPT said:
+GPT Icon
+
+Please share the embedding module or the relevant code snippet that you have, and I’ll help you integrate it into your autoencoder workflow or adapt it for your specific use case. If you also have a specific question or requirement related to this module, feel free to include that!
+You said:
+"""This script gives an example of how to use torch_frame to design tabular
+deep learning models in a modular way.
+"""
+
+import argparse
+import math
+import os.path as osp
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+from torch.nn import LayerNorm, Linear, Module, ModuleList
+from tqdm import tqdm
+
+import torch_frame
+from torch_frame import TensorFrame, stype
+from torch_frame.data import DataLoader
+from torch_frame.data.stats import StatType
+from torch_frame.datasets import Yandex
+from torch_frame.nn import (
+    Decoder,
+    EmbeddingEncoder,
+    LinearBucketEncoder,
+    StypeWiseFeatureEncoder,
+    TableConv,
+)
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataset', type=str, default='adult')
+parser.add_argument('--channels', type=int, default=128)
+parser.add_argument('--num_layers', type=int, default=3)
+parser.add_argument('--batch_size', type=int, default=256)
+parser.add_argument('--lr', type=float, default=0.001)
+parser.add_argument('--epochs', type=int, default=10)
+parser.add_argument('--seed', type=int, default=0)
+args = parser.parse_args()
+
+torch.manual_seed(args.seed)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Prepare dataset
+path = osp.join(osp.dirname(osp.realpath(__file__)), '..', 'data',
+                args.dataset)
+dataset = Yandex(root=path, name=args.dataset)
+# Materialize the dataset, which obtains TensorFrame from DataFrame.
+# TensorFrame stores DataFrame features as PyTorch tensors organized by
+# their stype (semantic type), e.g., categorical, numerical.
+dataset.materialize()
+# This tutorial only supports training/eval for classification.
+assert dataset.task_type.is_classification
+
+# Get pre-defined split
+train_dataset, val_dataset, test_dataset = dataset.split()
+
+train_tensor_frame = train_dataset.tensor_frame
+val_tensor_frame = val_dataset.tensor_frame
+test_tensor_frame = test_dataset.tensor_frame
+
+# Set up data loaders for TensorFrame
+train_loader = DataLoader(train_tensor_frame, batch_size=args.batch_size,
+                          shuffle=True)
+val_loader = DataLoader(val_tensor_frame, batch_size=args.batch_size)
+test_loader = DataLoader(test_tensor_frame, batch_size=args.batch_size)
+
+
+# Custom table convolution
+class SelfAttentionConv(TableConv):
+    r"""Simple self-attention-based table covolution to model interaction
+    between different columns.
+
+    Args:
+        channels (int): Hidden channel dimensionality
+    """
+    def __init__(self, channels: int):
+        super().__init__()
+        self.channels = channels
+        # Linear functions for modeling key/query/value in self-attention.
+        self.lin_k = Linear(channels, channels)
+        self.lin_q = Linear(channels, channels)
+        self.lin_v = Linear(channels, channels)
+
+    def forward(self, x: Tensor) -> Tensor:
+        r"""Convolves input tensor to model interaction between different cols.
+
+        Args:
+            x (Tensor): Input tensor of shape [batch_size, num_cols, channels]
+
+        Returns:
+            out (Tensor): Output tensor of shape
+                [batch_size, num_cols, channels]
+        """
+        # [batch_size, num_cols, channels]
+        x_key = self.lin_k(x)
+        x_query = self.lin_q(x)
+        x_value = self.lin_v(x)
+        # [batch_size, num_cols, num_cols]
+        prod = x_query.bmm(x_key.transpose(2, 1)) / math.sqrt(self.channels)
+        # Attention weights between all pairs of columns.
+        # Shape: [batch_size, num_cols, num_cols]
+        attn = F.softmax(prod, dim=-1)
+        # Mix x_value based on the attention weights
+        # Shape: [batch_size, num_cols, num_channels]
+        out = attn.bmm(x_value)
+        return out
+
+
+# Custom decoder
+class MeanDecoder(Decoder):
+    r"""Simple decoder that mean-pools over the embeddings of all columns and
+    apply a linear transformation to map the pooled embeddings to desired
+    dimensionality.
+
+    Args:
+        in_channels (int): Input channel dimensionality
+        out_channels (int): Output channel dimensionality
+    """
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        # Linear function to map pooled embeddings into desired dimensionality
+        self.lin = torch.nn.Linear(in_channels, out_channels)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Mean pooling over the column dimension
+        # [batch_size, num_cols, in_channels] -> [batch_size, in_channels]
+        out = torch.mean(x, dim=1)
+        # [batch_size, out_channels]
+        return self.lin(out)
+
+
+# Custom model
+class TabularNN(Module):
+    r"""The overall tabular NN model that takes in TensorFrame as input and
+    outputs row embeddings. It is a combination of
+    (1) Feature encoder (self.encoder): Mapping TensorFrame into
+        3-dimensional :obj:x of shape [batch_size, num_cols, channels]
+    (2) Table covolutions (self.convs): Iteratively transforming the
+        3-dimensional :obj:x
+    (3) Decoder (self.decoder): Maps the transformed 3-dimensional :obj:x
+        into 2-dimensional :obj:out of shape [batch_size, out_channels].
+        Each element of :obj:out represents the row embedding of the original
+        TensorFrame.
+
+    Args:
+        channels (int): Input/hidden channel dimensionality.
+        out_channels (int): Output channel dimensionality.
+        num_layers (int): Number of table covolution layers
+        col_stats (Dict[str, Dict[StatType, Any]]): Mapping from a column name
+            to column statistics. Easily obtained via :obj:dataset.col_stats
+        col_names_dict (Dict[torch_frame.stype, List[str]]): Mapping from stype
+            to a list of column names in the order stored in TensorFrame.
+            Easily obtained via :obj:tensor_frame.col_names_dict
+    """
+    def __init__(
+        self,
+        channels: int,
+        out_channels: int,
+        num_layers: int,
+        # kwargs for feature encoder
+        col_stats: dict[str, dict[StatType, Any]],
+        col_names_dict: dict[torch_frame.stype, list[str]],
+    ):
+        super().__init__()
+        # Specify what feature encoder to use for each stype.
+        # The custom feature encoder can be implemented by inheriting
+        # torch_frame.nn.StypeEncoder
+        stype_encoder_dict = {
+            # Use torch.nn.Embedding-based encoder for categorical features.
+            stype.categorical:
+            EmbeddingEncoder(),
+            # Use bucket-based encoder for numerical features introduced in
+            # https://arxiv.org/abs/2203.05556
+            # Apply post-hoc layer normalization (after linear bucket encoder)
+            stype.numerical:
+            LinearBucketEncoder(post_module=LayerNorm(channels)),
+        }
+        # StypeWiseFeatureEncoder will take TensorFrame as input and apply
+        # stype-specific feature encoder (specified via stype_encoder_dict)
+        # to PyTorch tensor of each stype to get embeddings for each stype. The
+        # embeddings of different stypes are then concatenated along the column
+        # axis. In all, it transforms TensorFrame into 3-dimensional tensor
+        # :obj:x of shape [batch_size, num_cols, channels].
+        self.encoder = StypeWiseFeatureEncoder(
+            out_channels=channels,
+            col_stats=col_stats,
+            col_names_dict=col_names_dict,
+            stype_encoder_dict=stype_encoder_dict,
+        )
+        # Set up table convolutions that iteratively transforms 3-dimensional
+        # :obj:x into another :obj:x
+        self.convs = ModuleList()
+        for _ in range(num_layers):
+            self.convs.append(SelfAttentionConv(channels))
+
+        # Set up decoder that transforms 3-dimensional :obj:x into
+        # 2-dimensional output tensor
+        self.decoder = MeanDecoder(channels, out_channels)
+
+    def forward(self, tf: TensorFrame) -> Tensor:
+        # [batch_size, num_cols, channels]
+        x, _ = self.encoder(tf)
+        for conv in self.convs:
+            # [batch_size, num_cols, channels]
+            x = conv(x)
+        # [batch_size, out_channels]
+        out = self.decoder(x)
+        return out
+
+
+# Set up model and optimizer
+model = TabularNN(
+    channels=args.channels,
+    out_channels=dataset.num_classes,
+    num_layers=args.num_layers,
+    col_stats=dataset.col_stats,
+    col_names_dict=train_tensor_frame.col_names_dict,
+).to(device)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+
+def train(epoch: int) -> float:
+    model.train()
+    loss_accum = total_count = 0
+
+    for tf in tqdm(train_loader, desc=f'Epoch: {epoch}'):
+        tf = tf.to(device)
+        pred = model(tf)
+        loss = F.cross_entropy(pred, tf.y)
+        optimizer.zero_grad()
+        loss.backward()
+        loss_accum += float(loss) * len(tf.y)
+        total_count += len(tf.y)
+        optimizer.step()
+    return loss_accum / total_count
+
+
+@torch.no_grad()
+def test(loader: DataLoader) -> float:
+    model.eval()
+    accum = total_count = 0
+
+    for tf in loader:
+        tf = tf.to(device)
+        pred = model(tf)
+        pred_class = pred.argmax(dim=-1)
+        accum += float((tf.y == pred_class).sum())
+        total_count += len(tf.y)
+
+    return accum / total_count
+
+
+best_val_acc = 0
+best_test_acc = 0
+for epoch in range(1, args.epochs + 1):
+    train_loss = train(epoch)
+    train_acc = test(train_loader)
+    val_acc = test(val_loader)
+    test_acc = test(test_loader)
+    if best_val_acc < val_acc:
+        best_val_acc = val_acc
+        best_test_acc = test_acc
+    print(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, '
+          f'Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}')
+
+print(f'Best Val Acc: {best_val_acc:.4f}, Best Test Acc: {best_test_acc:.4f}')
+ChatGPT said:
+GPT Icon
+
+This code is already modular and efficient for tabular data modeling using the torch_frame library. The core idea involves:
+
+    Modular Feature Encoding:
+        Separate handling for categorical, numerical, and
+
+You said:
+So, how would this approach compare with autoencoders for a mixed type tabular data which has about 400000 entries
+ChatGPT said:
+GPT Icon
+
+When comparing the torch_frame-based approach in the provided code with an autoencoder for mixed-type tabular data containing 400,000 entries, here’s how they differ in terms of objectives, capabilities, and trade-offs:
+1. Purpose and Use Case
+Aspect	Torch_Frame Approach	Autoencoder
+Goal	Classification or prediction-focused. Models interactions directly for a task.	Dimensionality reduction and unsupervised learning to capture latent features.
+Use Case	Targeted tasks like classification or regression. Handles structured tasks with supervision.	Extract compressed representations or embeddings for clustering, anomaly detection, or visualization.
+Downstream Task	Built-in (e.g., classification accuracy is the key metric).	Requires additional interpretation or application of latent space (e.g., clustering).
+2. Handling Mixed-Type Data
+Aspect	Torch_Frame Approach	Autoencoder
+Categorical Data	Uses EmbeddingEncoder for embeddings of categorical features.	Requires manual embedding for categorical variables (or one-hot encoding).
+Numerical Data	Encodes with LinearBucketEncoder (learned bins) for better feature representation.	Typically normalized (e.g., MinMaxScaler) for direct input.
+Textual Data	Supports embedding-based encoders for short text.	Often preprocessed separately with external NLP tools, then concatenated.
+Date-Time Data	Can encode using engineered columns or treat as numerical/categorical.	Requires preprocessing into meaningful features (e.g., day, month, etc.).
+3. Performance on Large Datasets (400k Entries)
+Aspect	Torch_Frame Approach	Autoencoder
+Training Time	Fast, as it focuses on supervised learning and uses modular feature encoders.	Can be slower due to iterative learning to reconstruct input features.
+Scalability	Scales well for large datasets; relies on a structured DataFrame-like input.	Handles large datasets but may require dimensionality reduction before encoding.
+Resource Usage	Efficient for supervised learning tasks.	Higher compute demands for reconstructing complex mixed-type data.
+4. Interpretability
+Aspect	Torch_Frame Approach	Autoencoder
+Feature Importance	Easier to analyze; interpretable due to modularity and separate feature encoders.	Harder to interpret latent dimensions; embeddings need correlation studies or SHAP/LIME.
+Latent Space	Not explicitly designed to provide a latent space.	Provides a compressed latent space that can reveal hidden structures.
+5. Advantages and Limitations
+Aspect	Torch_Frame Advantages	Autoencoder Advantages
+Advantages	Tailored for classification, modular design for mixed data types, efficient use of resources.	Discovers hidden patterns or structures, reduces data dimensionality, and can be used for unsupervised tasks.
+Limitations	Focused on supervised tasks; less useful for unsupervised objectives.	Requires preprocessing, high training time, and interpretation of latent dimensions.
+6. Choosing Between Them
+Use Torch_Frame If:
+
+    You have a clear downstream task (e.g., classification or regression).
+    You want a modular and structured pipeline with easily interpretable components.
+    You need efficient training and scalability for large datasets.
+
+Use Autoencoder If:
+
+    You aim to extract embeddings for clustering, anomaly detection, or feature compression.
+    Your task is unsupervised or exploratory.
+    You prioritize learning latent representations rather than task-specific predictions.
+
+Hybrid Approach
+
+For some use cases, combining both approaches can be beneficial:
+
+    Use Torch_Frame to preprocess the data into embeddings efficiently.
+    Pass the embeddings through an Autoencoder to further refine and compress the features.
+
+Would you like an example of combining the strengths of both approaches or help adapting one approach to a specific task?
+You said:
+Let's say that I have a dataset with several features (among many others) as an example: UserName(text), InterestRate(numerical), LoanPurpose(Categorical), DueDate(date). 
+I adjusted the pytorch frame by incorporating linear /projection layers and skipped the decoder module. This alows me to create embeddings of desired dimension.
+
+After I create the embedding vectors, I need to extract those subvectors that correspond to (let's say) UserName and InterestRate. Which method from the two discussed above would work in this case?
+ChatGPT said:
+GPT Icon
+
+To address the requirement of extracting subvectors corresponding to specific features (e.g., UserName and InterestRate) from the embedding vectors generated by your adjusted torch_frame approach, let’s evaluate the two discussed methods:
+Torch_Frame Approach
+
+Since torch_frame already supports modular feature encoding based on feature types, it’s well-suited for extracting subvectors for specific features. Here’s why:
+
+    Explicit Feature Mapping:
+        With torch_frame, each column of the TensorFrame is mapped explicitly to its corresponding part in the embedding vector. You can leverage the col_names_dict attribute, which organizes feature names by their semantic type (stype), to extract the specific features.
+
+    Efficient Subvector Extraction:
+        Since feature embeddings are aligned column-wise in the final vector, you can directly slice or index the embedding vector to extract parts corresponding to specific features.
+
+    Simpler Workflow:
+        No need for additional processing—torch_frame keeps track of feature positions in the embedding vector, making the extraction straightforward.
+
+How to Extract Subvectors:
+
+Modify your model to output the embeddings for specific features by using the feature names or indices from the col_names_dict. Example:
+
+# Extract the embeddings of specific features, e.g., 'UserName' and 'InterestRate'
+feature_names_to_extract = ['UserName', 'InterestRate']
+
+# Get column indices for the selected features
+col_indices = [
+    train_tensor_frame.col_names_dict[stype.textual].index('UserName'),
+    train_tensor_frame.col_names_dict[stype.numerical].index('InterestRate')
+]
+
+# Forward pass to get embeddings
+with torch.no_grad():
+    embeddings, _ = model.encoder(train_tensor_frame)
+
+# Extract embeddings for selected features
+subvectors = embeddings[:, col_indices, :]  # Shape: [batch_size, num_features_to_extract, embedding_dim]
+
+Autoencoder Approach
+
+The autoencoder method, in contrast, focuses on learning compressed representations of the entire dataset, without directly maintaining feature alignment. While you can still correlate latent dimensions with input features, it is less straightforward to extract specific feature embeddings because:
+
+    No Direct Mapping:
+        The autoencoder's latent space doesn’t explicitly track individual feature positions. Instead, it captures a compressed representation of the data as a whole.
+
+    Post-Hoc Correlation:
+        Extracting specific features would require post-hoc correlation between the latent dimensions and the features, which is indirect and may not yield precise mappings.
+
+    Not Designed for Feature Subvector Extraction:
+        Autoencoders are not inherently designed for extracting subvectors for specific features but are better suited for holistic data compression and representation.
+
+Recommendation
+Use Torch_Frame for Subvector Extraction:
+
+    The modular design of torch_frame explicitly associates embeddings with input features, allowing direct and efficient subvector extraction.
+    The col_names_dict provides a clear mapping between feature names and their corresponding positions in the embedding vector, making the task trivial.
+
+Next Steps
+
+Would you like help modifying your adjusted torch_frame implementation to support subvector extraction directly, or should I provide a full example demonstrating this on a mock dataset?
+You said:
+Here is my adaptation of the module
+
+"""This script gives an example of how to use torch_frame to design tabular
+deep learning models in a modular way.
+"""
+
+# Custom table convolution
+class SelfAttentionConv(TableConv):
+
+    """Simple self-attention-based table covolution to model interaction
+    between different columns.
+
+    Args:
+        channels (int): Hidden channel dimensionality
+    """
+    def __init__(self, channels: int):
+        super().__init__()
+        self.channels = channels
+        # Linear functions for modeling key/query/value in self-attention.
+        self.lin_k = Linear(channels, channels)
+        self.lin_q = Linear(channels, channels)
+        self.lin_v = Linear(channels, channels)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Convolves input tensor to model interaction between different cols.
+
+        Args:
+            x (Tensor): Input tensor of shape [batch_size, num_cols, channels]
+
+        Returns:
+            out (Tensor): Output tensor of shape
+                [batch_size, num_cols, channels]
+        """
+        # [batch_size, num_cols, channels]
+        x_key = self.lin_k(x)
+        x_query = self.lin_q(x)
+        x_value = self.lin_v(x)
+        # [batch_size, num_cols, num_cols]
+        prod = x_query.bmm(x_key.transpose(2, 1)) / math.sqrt(self.channels)
+        # Attention weights between all pairs of columns.
+        # Shape: [batch_size, num_cols, num_cols]
+        attn = F.softmax(prod, dim=-1)
+        # Mix x_value based on the attention weights
+        # Shape: [batch_size, num_cols, num_channels]
+        out = attn.bmm(x_value)
+        return out
+
+
+# Custom decoder
+class MeanDecoder(Decoder):
+    """Simple decoder that mean-pools over the embeddings of all columns and
+    apply a linear transformation to map the pooled embeddings to desired
+    dimensionality.
+
+    Args:
+        in_channels (int): Input channel dimensionality
+        out_channels (int): Output channel dimensionality
+    """
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        # Linear function to map pooled embeddings into desired dimensionality
+        self.lin = torch.nn.Linear(in_channels, out_channels)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Mean pooling over the column dimension
+        # [batch_size, num_cols, in_channels] -> [batch_size, in_channels]
+        out = torch.mean(x, dim=1)
+        # [batch_size, out_channels]
+        return self.lin(out)
+
+
+# Custom model
+class TabularNN(Module):
+
+    """The overall tabular NN model that takes in TensorFrame as input and
+    outputs row embeddings. It is a combination of
+    (1) Feature encoder (self.encoder): Mapping TensorFrame into
+        3-dimensional :obj:x of shape [batch_size, num_cols, channels]
+    (2) Table covolutions (self.convs): Iteratively transforming the
+        3-dimensional :obj:x
+    (3) Decoder (self.decoder): Maps the transformed 3-dimensional :obj:x
+        into 2-dimensional :obj:out of shape [batch_size, out_channels].
+        Each element of :obj:out represents the row embedding of the original
+        TensorFrame.
+
+    Args:
+        channels (int): Input/hidden channel dimensionality.
+        out_channels (int): Output channel dimensionality.
+        num_layers (int): Number of table covolution layers
+        col_stats (Dict[str, Dict[StatType, Any]]): Mapping from a column name
+            to column statistics. Easily obtained via :obj:dataset.col_stats
+        col_names_dict (Dict[torch_frame.stype, List[str]]): Mapping from stype
+            to a list of column names in the order stored in TensorFrame.
+            Easily obtained via :obj:tensor_frame.col_names_dict
+    """
+    def __init__(
+        self,
+        channels: int,
+        out_channels: int,
+        num_layers: int,
+        # kwargs for feature encoder
+        col_stats: dict[str, dict[StatType, Any]],
+        col_names_dict: dict[torch_frame.stype, list[str]],
+    ):
+        super().__init__()
+        # Specify what feature encoder to use for each stype.
+        # The custom feature encoder can be implemented by inheriting
+        # torch_frame.nn.StypeEncoder
+        stype_encoder_dict = {
+            stype.categorical: EmbeddingEncoder(),
+            stype.numerical: LinearEncoder(),
+            # If text_stype is text_embedded,
+            # it becomes embedding after materialization
+            text_stype.parent: LinearEmbeddingEncoder(),
+            stype.timestamp: TimestampEncoder()
+            }
+        # StypeWiseFeatureEncoder will take TensorFrame as input and apply
+        # stype-specific feature encoder (specified via stype_encoder_dict)
+        # to PyTorch tensor of each stype to get embeddings for each stype. The
+        # embeddings of different stypes are then concatenated along the column
+        # axis. In all, it transforms TensorFrame into 3-dimensional tensor
+        # :obj:x of shape [batch_size, num_cols, channels].
+        self.encoder = StypeWiseFeatureEncoder(
+            out_channels=channels,
+            col_stats=col_stats,
+            col_names_dict=col_names_dict,
+            stype_encoder_dict=stype_encoder_dict,
+        )
+        # Set up table convolutions that iteratively transforms 3-dimensional
+        # :obj:x into another :obj:x
+        self.convs = ModuleList()
+        for _ in range(num_layers):
+            self.convs.append(SelfAttentionConv(channels))
+
+        # Set up decoder that transforms 3-dimensional :obj:x into
+        # 2-dimensional output tensor
+        self.decoder = MeanDecoder(channels, out_channels)
+
+    def forward(self, tf: TensorFrame, return_embeddings: bool=False) -> Tensor:
+        # [batch_size, num_cols, channels]
+        x, _ = self.encoder(tf)
+        for conv in self.convs:
+            # [batch_size, num_cols, channels]
+            x = conv(x)
+        if return_embeddings: # Return embeddings directly after convolution layers
+            out = x
+        else: # [batch_size, out_channels]
+            out = self.decoder(x)
+
+        return out
+
+
+and 
+
+# Function to get embeddings from a DataFrame
+#from torch.nn.functional import normalize
+
+def get_embeddings_from_dataframe(df: pd.DataFrame,
+                                  tf: TensorFrame,
+                                  model: TabularNN,
+                                  format: str,
+                                  device: torch.device) -> pd.Series:
+    """
+    Converts a Pandas DataFrame into embeddings using the TabularNN model.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        model (TabularNN): Trained TabularNN model.
+        device (torch.device): Device to run the model on.
+
+    Returns:
+        np.array: Where each entry is a flattened and normalized embedding vector.
+        pd.Series: Series where each entry is a flattened and normalized embedding vector.
+    """
+    # Create the embeddings
+    embeddings = model.forward(tf, return_embeddings=True)
+
+    # Flatten embeddings into row-level vectors
+    row_embeddings = embeddings.reshape(embeddings.shape[0], -1)  # [rows, columns * channels]
+
+    # Normalize (L2 norm) the embeddings row-wise
+    row_embeddings = F.normalize(row_embeddings, p=2, dim=1)
+
+    if format=='get_np':
+        # Detach and move embeddings to CPU, then convert to Pandas Series
+        row_embeddings = row_embeddings.detach().cpu().numpy()
+    elif format=='get_pd':
+        # Convert each row vector to a Python list
+        row_embeddings = pd.Series(row_embeddings.detach().cpu().numpy().tolist(),
+        # Use the original DataFrame's index for alignment
+        index=df.index,
+        # Name the series
+        name=f"row_embeddings"
+        )
+
+    return row_embeddings
+
+
+ChatGPT said:
+GPT Icon
+
+​
+You said:
+and
+ChatGPT said:
+GPT Icon
+
+​
+You said:
+and also:
+
+# Define the function to reorder DataFrame columns
+def reorder_columns(df, col_dict, col_list):
+    """
+    Reorders the columns of a DataFrame based on the order specified in a dictionary.
+
+    Args:
+        df (pd.DataFrame): The DataFrame whose columns need to be reordered.
+        col_dict (dict): Dictionary defining the column types and their respective columns.
+        col_list (list): List of all columns to ensure no column is left behind.
+
+    Returns:
+        pd.DataFrame: DataFrame with reordered columns.
+    """
+
+    # Concatenate the columns from the dictionary in the order of the keys
+    ordered_columns = []
+    for key in col_dict:
+        ordered_columns.extend(col_dict[key])
+
+    # Add any columns from col_list not included in the dictionary to the end
+    #remaining_columns = [col for col in col_list if col not in ordered_columns]
+    #final_column_order = ordered_columns + remaining_columns
+
+    # Reorder the DataFrame
+    #df = df[final_column_order]
+    df = df[ordered_columns]
+    return df
+
+Can you optimize these together?
+ChatGPT said:
+GPT Icon
+
+Here's an optimized, consolidated version of your script. I've streamlined the functions and classes for better readability, reduced redundant comments, and added a flexible pipeline for generating and reordering embeddings for specific features.
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.nn import Linear, ModuleList
+import pandas as pd
+import math
+from typing import Any, Dict, List
+
+# Optimized Self-Attention Convolution
+class SelfAttentionConv(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.channels = channels
+        self.lin_k = Linear(channels, channels)
+        self.lin_q = Linear(channels, channels)
+        self.lin_v = Linear(channels, channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_key = self.lin_k(x)
+        x_query = self.lin_q(x)
+        x_value = self.lin_v(x)
+        attn = F.softmax(x_query.bmm(x_key.transpose(2, 1)) / math.sqrt(self.channels), dim=-1)
+        return attn.bmm(x_value)
+
+# Optimized Mean Decoder
+class MeanDecoder(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.lin = Linear(in_channels, out_channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.lin(torch.mean(x, dim=1))
+
+# Optimized Tabular Neural Network
+class TabularNN(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        out_channels: int,
+        num_layers: int,
+        col_stats: Dict[str, Dict[Any, Any]],
+        col_names_dict: Dict[str, List[str]],
+    ):
+        super().__init__()
+        self.encoder = StypeWiseFeatureEncoder(
+            out_channels=channels,
+            col_stats=col_stats,
+            col_names_dict=col_names_dict,
+            stype_encoder_dict={
+                stype.categorical: EmbeddingEncoder(),
+                stype.numerical: LinearEncoder(),
+                text_stype.parent: LinearEmbeddingEncoder(),
+                stype.timestamp: TimestampEncoder(),
+            },
+        )
+        self.convs = ModuleList([SelfAttentionConv(channels) for _ in range(num_layers)])
+        self.decoder = MeanDecoder(channels, out_channels)
+
+    def forward(self, tf: TensorFrame, return_embeddings: bool = False) -> torch.Tensor:
+        x, _ = self.encoder(tf)
+        for conv in self.convs:
+            x = conv(x)
+        return x if return_embeddings else self.decoder(x)
+
+# Function to Generate Embeddings from DataFrame
+def get_embeddings_from_dataframe(
+    df: pd.DataFrame,
+    tf: TensorFrame,
+    model: TabularNN,
+    format: str,
+    device: torch.device,
+) -> pd.Series:
+    model.eval()
+    with torch.no_grad():
+        embeddings = model(tf.to(device), return_embeddings=True)
+        row_embeddings = F.normalize(embeddings.reshape(embeddings.shape[0], -1), p=2, dim=1)
+
+    if format == "get_np":
+        return row_embeddings.detach().cpu().numpy()
+    elif format == "get_pd":
+        return pd.Series(row_embeddings.detach().cpu().numpy().tolist(), index=df.index, name="row_embeddings")
+
+# Function to Reorder DataFrame Columns
+def reorder_columns(df: pd.DataFrame, col_dict: Dict[str, List[str]]) -> pd.DataFrame:
+    ordered_columns = [col for key in col_dict for col in col_dict[key]]
+    return df[ordered_columns]
+
+Optimizations Made
+
+    Class Simplification:
+        Combined repetitive code in SelfAttentionConv and MeanDecoder for clarity.
+        Removed redundant comments in the class definitions for better readability.
+
+    get_embeddings_from_dataframe Improvements:
+        Simplified normalization and device handling.
+        Unified the return structure for np.array and pd.Series.
+
+    Reordering Columns:
+        Eliminated redundant logic for identifying and appending missing columns.
+        Assumed col_dict provides the necessary order for all columns.
+
+    Device Management:
+        Added to(device) calls to ensure compatibility with GPUs or CPUs seamlessly.
+
+Example Usage
+Generate Embeddings
+
+# Assuming `df`, `tf`, `model`, and `device` are already defined
+embeddings = get_embeddings_from_dataframe(df, tf, model, format="get_pd", device=device)
+
+Reorder Columns
+
+# Assuming `col_dict` defines the desired column order
+reordered_df = reorder_columns(df, col_dict)
+
+Scenarios Addressed
+
+    Creating normalized embeddings for use in clustering, similarity search, or downstream tasks.
+    Reordering DataFrame columns for feature alignment with the embedding model.
+
+Would you like further help on testing this pipeline or integrating it into a larger workflow?
+You said:
+One more to add
+
+def get_feature_embeddings(df: pd.DataFrame,
+                           embeddings: np.ndarray,
+                           selected_features: list,
+                           n: int,
+                           save_path: str) -> pd.DataFrame:
+    """
+    Extracts specific feature embeddings from a NumPy array, saves them to a pickle file, and returns a DataFrame.
+
+    Args:
+        df (pd.DataFrame): DataFrame with column names aligned with embeddings.
+        embeddings (np.ndarray): Array of shape (rows, columns * channels), where embeddings are flattened.
+        selected_features (list): List of feature names to extract.
+        n (int): Number of channels (dimensions) per feature.
+        save_path (str): Path to save the embeddings as a pickle file.
+
+    Returns:
+        pd.DataFrame: DataFrame containing flattened embeddings and original vectors for the selected features.
+    """
+    # Map feature names to their indices
+    feature_indices = {feature: i for i, feature in enumerate(df.columns)}
+
+    # Validate selected features
+    if not all(feature in feature_indices for feature in selected_features):
+        raise ValueError("Some selected features are not in the DataFrame columns.")
+
+    # Extract indices for the selected features
+    selected_indices = [
+        range(feature_indices[feature] * n, (feature_indices[feature] + 1) * n)
+        for feature in selected_features
+    ]
+
+    # Flatten selected_indices
+    selected_indices = [idx for sublist in selected_indices for idx in sublist]
+
+    # Extract embeddings for the selected indices
+    selected_embeddings = embeddings[:, selected_indices]  # Shape: (rows, len(selected_features) * n)
+
+    # Save the selected embeddings to a pickle file
+    with open(save_path, 'wb') as f:
+        pickle.dump(selected_embeddings, f)
+
+    # Create column names dynamically for flattened vectors
+    flat_column_names = [
+        f"{feature}_dim{dim}"
+        for feature in selected_features
+        for dim in range(n)
+    ]
+
+    # Convert flattened embeddings into a DataFrame
+    selected_embeddings_df = pd.DataFrame(selected_embeddings, columns=flat_column_names)
+
+    # Add a column for each feature with the full vector
+    for feature in selected_features:
+        feature_start_idx = feature_indices[feature] * n
+        feature_end_idx = feature_start_idx + n
+        selected_embeddings_df[feature] = list(embeddings[:, feature_start_idx:feature_end_idx])
+
+    return selected_embeddings #_df
+ChatGPT said:
+GPT Icon
+
+Here’s an optimized version of your get_feature_embeddings function, along with enhancements for better readability, efficiency, and maintainability.
+Optimized Function
+
+import pickle
+import pandas as pd
+import numpy as np
+
+
+def get_feature_embeddings(
+    df: pd.DataFrame,
+    embeddings: np.ndarray,
+    selected_features: list,
+    n: int,
+    save_path: str,
+) -> pd.DataFrame:
+    """
+    Extracts specific feature embeddings from a NumPy array, saves them to a pickle file, 
+    and returns a DataFrame with both flattened and original vector formats.
+
+    Args:
+        df (pd.DataFrame): DataFrame with column names aligned with embeddings.
+        embeddings (np.ndarray): Array of shape (rows, columns * channels), where embeddings are flattened.
+        selected_features (list): List of feature names to extract.
+        n (int): Number of channels (dimensions) per feature.
+        save_path (str): Path to save the embeddings as a pickle file.
+
+    Returns:
+        pd.DataFrame: DataFrame containing flattened embeddings and original vectors for the selected features.
+    """
+    # Validate selected features
+    missing_features = [feature for feature in selected_features if feature not in df.columns]
+    if missing_features:
+        raise ValueError(f"Some selected features are not in the DataFrame columns: {missing_features}")
+
+    # Map feature names to their indices
+    feature_indices = {feature: i for i, feature in enumerate(df.columns)}
+
+    # Extract indices for the selected features
+    selected_indices = [
+        range(feature_indices[feature] * n, (feature_indices[feature] + 1) * n)
+        for feature in selected_features
+    ]
+    # Flatten selected indices
+    selected_indices = [idx for sublist in selected_indices for idx in sublist]
+
+    # Extract embeddings for the selected features
+    selected_embeddings = embeddings[:, selected_indices]  # Shape: (rows, len(selected_features) * n)
+
+    # Save the selected embeddings to a pickle file
+    with open(save_path, 'wb') as f:
+        pickle.dump(selected_embeddings, f)
+
+    # Create flattened column names dynamically
+    flat_column_names = [
+        f"{feature}_dim{dim}"
+        for feature in selected_features
+        for dim in range(n)
+    ]
+
+    # Create a DataFrame for flattened embeddings
+    selected_embeddings_df = pd.DataFrame(selected_embeddings, columns=flat_column_names)
+
+    # Add original vectors for each feature
+    for feature in selected_features:
+        feature_start_idx = feature_indices[feature] * n
+        feature_end_idx = feature_start_idx + n
+        selected_embeddings_df[f"{feature}_vector"] = list(embeddings[:, feature_start_idx:feature_end_idx])
+
+    return selected_embeddings_df
+
+Enhancements Made:
+
+    Error Handling:
+        Validates selected_features against the DataFrame columns and raises a descriptive error if any are missing.
+
+    Dynamic Column Naming:
+        Automatically generates column names for flattened embeddings using a consistent naming convention.
+
+    Efficient Index Calculation:
+        Streamlined index extraction for selected features using Python’s list comprehensions.
+
+    Return Value:
+        Outputs a well-structured DataFrame containing:
+            Flattened embeddings as individual columns.
+            Full vectors for each feature stored as lists in separate columns.
+
+Example Usage
+Inputs
+
+# Sample DataFrame
+df = pd.DataFrame({
+    'UserName': ['Alice', 'Bob', 'Charlie'],
+    'InterestRate': [3.5, 4.2, 5.1],
+    'LoanPurpose': ['Home', 'Car', 'Education'],
+    'DueDate': ['2023-01-01', '2023-02-15', '2023-03-10'],
+})
+
+# Mock Embeddings (3 rows, 4 features * 2 channels)
+embeddings = np.random.rand(3, 8)
+
+# Selected features
+selected_features = ['UserName', 'InterestRate']
+
+# Number of channels per feature
+n = 2
+
+# Path to save embeddings
+save_path = "selected_embeddings.pkl"
+
+Generate Feature Embeddings
+
+selected_embeddings_df = get_feature_embeddings(
+    df=df,
+    embeddings=embeddings,
+    selected_features=selected_features,
+    n=n,
+    save_path=save_path
+)
+
+# View the resulting DataFrame
+print(selected_embeddings_df)
+
+Output DataFrame
+UserName_dim0	UserName_dim1	InterestRate_dim0	InterestRate_dim1	UserName_vector	InterestRate_vector
+0.23	0.45	0.67	0.89	[0.23, 0.45]	[0.67, 0.89]
+0.78	0.56	0.12	0.34	[0.78, 0.56]	[0.12, 0.34]
+0.90	0.45	0.33	0.76	[0.90, 0.45]	[0.33, 0.76]
+Next Steps
+
+    Would you like to integrate this into a larger pipeline for embedding generation and feature extraction?
+    Do you want to visualize these embeddings or cluster them for further analysis?
+
+You said:
+I have a question about text embeddings. I am using transformers or sentence-transformers to embed city names and zipcodes. These will give me 768 dim vectors. What is the best way to reduce dimension to 32, 64 or another dimension of choice. At the moment I am using a linear projection layer. Are there better options?
+ChatGPT said:
+GPT Icon
+
+Reducing high-dimensional embeddings (e.g., 768-dimensional from transformers) to a lower dimension (e.g., 32 or 64) is a common task, especially for computational efficiency and to avoid overparameterization in downstream models. While a linear projection layer is a simple and effective approach, there are other methods you can consider depending on your requirements.
+Options for Dimensionality Reduction
+1. Linear Projection (Current Approach)
+
+    How it works:
+        A single torch.nn.Linear layer reduces the dimensionality through a learned weight matrix.
+        It maps the 768-dimensional input to a target dimension (e.g., 32 or 64).
+    Pros:
+        Simple and efficient.
+        Learnable weights adapt to the downstream task.
+        Works well if the data has linear separability in the higher-dimensional space.
+    Cons:
+        May not capture non-linear relationships in the original embeddings.
+
+2. Principal Component Analysis (PCA)
+
+    How it works:
+        PCA identifies orthogonal directions (principal components) in the data that explain the maximum variance and projects the data onto these components.
+    When to use:
+        Preprocessing step for static embeddings (e.g., one-time dimensionality reduction).
+    Pros:
+        Captures the most important variance in the data.
+        Reduces redundancy in high-dimensional embeddings.
+    Cons:
+        Non-learnable (fixed transformation after fitting).
+        Does not adapt to task-specific signals.
+
+3. Autoencoder
+
+    How it works:
+        An autoencoder compresses the input into a low-dimensional latent space using a neural network, allowing for non-linear reduction.
+        The decoder reconstructs the original embedding from the compressed representation.
+    Pros:
+        Non-linear compression captures complex relationships.
+        Learnable and adaptable to your data distribution.
+    Cons:
+        Training can be computationally expensive.
+        Requires careful tuning of architecture and hyperparameters.
+
+4. Uniform Manifold Approximation and Projection (UMAP)
+
+    How it works:
+        UMAP is a non-linear dimensionality reduction technique that preserves both local and global structures of the data.
+    When to use:
+        Preprocessing embeddings for clustering or visualization.
+    Pros:
+        Retains meaningful relationships in the data.
+        Scalable and efficient.
+    Cons:
+        Non-learnable (like PCA).
+        May not be ideal for downstream tasks requiring task-specific fine-tuning.
+
+5. Factorization Techniques (e.g., Matrix Factorization, SVD)
+
+    How it works:
+        Decomposes the embedding matrix into low-rank approximations.
+    When to use:
+        For batch processing of embeddings without task-specific requirements.
+    Pros:
+        Captures latent structure in data.
+    Cons:
+        Non-learnable and fixed after fitting.
+
+6. Non-Linear Projection Layers (MLP or Attention-Based Layers)
+
+    How it works:
+        A multi-layer perceptron (MLP) or attention-based mechanism reduces the dimensionality using non-linear transformations.
+    Pros:
+        More expressive than linear layers.
+        Adaptable to task-specific requirements.
+    Cons:
+        Computationally more expensive.
+        Requires more training data to avoid overfitting.
+
+Recommended Approach
+
+    For general-purpose dimensionality reduction:
+        A linear projection layer is efficient and effective, especially when you’re fine-tuning on a downstream task.
+        Combine it with regularization (e.g., dropout) to avoid overfitting.
+
+    For static embeddings or pre-computed representations:
+        Use PCA or UMAP to preprocess embeddings into a lower dimension.
+
+    For complex relationships:
+        Consider a non-linear projection layer (e.g., an MLP) if you have sufficient data and computational resources.
+
+Example: Using Linear Projection with PyTorch
+
+import torch
+import torch.nn as nn
+
+class DimensionalityReducer(nn.Module):
+    def __init__(self, input_dim, reduced_dim):
+        super().__init__()
+        self.projection = nn.Linear(input_dim, reduced_dim)
+
+    def forward(self, x):
+        return self.projection(x)
+
+# Example usage
+input_dim = 768
+reduced_dim = 64
+reducer = DimensionalityReducer(input_dim, reduced_dim)
+
+# Dummy transformer embedding
+embedding = torch.randn(1, input_dim)  # Batch size 1, 768 dimensions
+reduced_embedding = reducer(embedding)
+print(reduced_embedding.shape)  # Output: torch.Size([1, 64])
+
+Hybrid Example: Autoencoder for Non-Linear Reduction
+
+class Autoencoder(nn.Module):
+    def __init__(self, input_dim, reduced_dim):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, reduced_dim)
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(reduced_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, input_dim)
+        )
+
+    def forward(self, x):
+        latent = self.encoder(x)
+        reconstructed = self.decoder(latent)
+        return latent, reconstructed
+
+# Example usage
+autoencoder = Autoencoder(input_dim=768, reduced_dim=64)
+embedding = torch.randn(1, 768)  # Dummy transformer embedding
+latent, reconstructed = autoencoder(embedding)
+print(latent.shape)  # Output: torch.Size([1, 64])
+
+Next Steps
+
+    Would you like to explore UMAP or PCA integration into your workflow for preprocessing embeddings?
+    Do you want help designing a specific non-linear reduction layer for task-specific embedding compression?
+
+You said:
+Please add regularization/droput to the linear projection layer
+ChatGPT said:
+GPT Icon
+
+Here’s an updated version of the linear projection layer with dropout regularization to prevent overfitting during dimensionality reduction:
+Updated Dimensionality Reducer with Dropout
+
+import torch
+import torch.nn as nn
+
+class DimensionalityReducer(nn.Module):
+    """
+    A dimensionality reduction module with a linear projection layer and dropout regularization.
+    
+    Args:
+        input_dim (int): Dimension of the input embeddings.
+        reduced_dim (int): Dimension to reduce the embeddings to.
+        dropout_prob (float): Probability of dropping out neurons during training.
+    """
+    def __init__(self, input_dim, reduced_dim, dropout_prob=0.1):
+        super().__init__()
+        self.projection = nn.Linear(input_dim, reduced_dim)
+        self.dropout = nn.Dropout(p=dropout_prob)  # Dropout for regularization
+
+    def forward(self, x):
+        """
+        Applies the linear projection followed by dropout.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape [batch_size, input_dim].
+        
+        Returns:
+            torch.Tensor: Output tensor of shape [batch_size, reduced_dim].
+        """
+        x = self.projection(x)
+        x = self.dropout(x)
+        return x
+
+# Example usage
+input_dim = 768
+reduced_dim = 64
+dropout_prob = 0.2  # 20% dropout
+
+reducer = DimensionalityReducer(input_dim, reduced_dim, dropout_prob)
+
+# Dummy transformer embedding
+embedding = torch.randn(1, input_dim)  # Batch size 1, 768 dimensions
+reduced_embedding = reducer(embedding)
+
+print(reduced_embedding.shape)  # Output: torch.Size([1, 64])
+
+Key Additions:
+
+    Dropout Regularization:
+        nn.Dropout(p): Randomly sets elements to zero during training with probability p (e.g., p=0.1 means 10% dropout).
+
+    Usage in the Module:
+        Dropout is applied immediately after the linear projection to regularize the reduced embeddings and avoid overfitting.
+
+Benefits of Adding Dropout
+
+    Improves Generalization:
+        Prevents the model from relying too heavily on specific neurons, improving robustness.
+    Reduces Overfitting:
+        Particularly useful when training on smaller datasets.
+    Seamless Integration:
+        Dropout is automatically disabled during evaluation (model.eval()).
+
+Optional Additions
+
+If further regularization is needed, you can combine batch normalization with dropout:
+
+class DimensionalityReducerWithBatchNorm(nn.Module):
+    def __init__(self, input_dim, reduced_dim, dropout_prob=0.1):
+        super().__init__()
+        self.projection = nn.Linear(input_dim, reduced_dim)
+        self.batch_norm = nn.BatchNorm1d(reduced_dim)  # Batch normalization
+        self.dropout = nn.Dropout(p=dropout_prob)
+
+    def forward(self, x):
+        x = self.projection(x)
+        x = self.batch_norm(x)
+        x = self.dropout(x)
+        return x
+
+# Example usage
+reducer_with_bn = DimensionalityReducerWithBatchNorm(input_dim, reduced_dim, dropout_prob=0.2)
+
+Next Steps
+
+    Would you like to integrate this into a larger embedding pipeline?
+    Do you want to explore adding other regularization techniques, like weight decay or L2 normalization?
+
+You said:
+Lets integrate this with feature selection from before
+ChatGPT said:
+GPT Icon
+
+Here’s an integrated implementation of the dimensionality reduction with dropout regularization combined with the feature selection and embedding extraction functions.
+
+This script unifies:
+
+    Dimensionality Reduction with a linear projection layer and dropout regularization.
+    Feature Selection for extracting embeddings for specific features.
+    Efficient handling of both flattened and vector-form embeddings.
+
+Integrated Implementation
+
+import pickle
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class DimensionalityReducer(nn.Module):
+    """
+    Dimensionality reduction with a linear projection layer and dropout regularization.
+    
+    Args:
+        input_dim (int): Dimension of the input embeddings.
+        reduced_dim (int): Dimension to reduce the embeddings to.
+        dropout_prob (float): Probability of dropping out neurons during training.
+    """
+    def __init__(self, input_dim, reduced_dim, dropout_prob=0.1):
+        super().__init__()
+        self.projection = nn.Linear(input_dim, reduced_dim)
+        self.dropout = nn.Dropout(p=dropout_prob)
+
+    def forward(self, x):
+        x = self.projection(x)
+        x = self.dropout(x)
+        return x
+
+
+def get_embeddings_from_dataframe(
+    df: pd.DataFrame,
+    tf: torch.Tensor,
+    model: nn.Module,
+    reducer: DimensionalityReducer,
+    format: str,
+    device: torch.device,
+) -> pd.Series:
+    """
+    Converts a DataFrame into embeddings, applies dimensionality reduction, and returns results.
+    
+    Args:
+        df (pd.DataFrame): Input DataFrame with feature names aligned to embeddings.
+        tf (torch.Tensor): Tensor representation of the DataFrame.
+        model (nn.Module): Trained model for generating embeddings.
+        reducer (DimensionalityReducer): Dimensionality reduction module.
+        format (str): Output format, either 'get_np' or 'get_pd'.
+        device (torch.device): Device to run the model and reducer on.
+    
+    Returns:
+        pd.Series: Series with flattened, normalized, and reduced embeddings.
+    """
+    model.eval()
+    reducer.eval()
+
+    # Generate embeddings using the model
+    with torch.no_grad():
+        embeddings = model(tf.to(device), return_embeddings=True)
+        reduced_embeddings = reducer(embeddings)
+        reduced_embeddings = F.normalize(reduced_embeddings, p=2, dim=1)  # L2 normalization
+
+    if format == "get_np":
+        return reduced_embeddings.detach().cpu().numpy()
+    elif format == "get_pd":
+        return pd.Series(reduced_embeddings.detach().cpu().numpy().tolist(), index=df.index, name="row_embeddings")
+
+
+def get_feature_embeddings(
+    df: pd.DataFrame,
+    embeddings: np.ndarray,
+    selected_features: list,
+    n: int,
+    save_path: str,
+) -> pd.DataFrame:
+    """
+    Extracts embeddings for selected features, saves them to a pickle file, and returns a DataFrame.
+    
+    Args:
+        df (pd.DataFrame): DataFrame with column names aligned with embeddings.
+        embeddings (np.ndarray): Flattened embeddings.
+        selected_features (list): List of feature names to extract.
+        n (int): Number of dimensions (channels) per feature.
+        save_path (str): Path to save the embeddings as a pickle file.
+    
+    Returns:
+        pd.DataFrame: DataFrame containing flattened and vector embeddings for selected features.
+    """
+    # Map feature names to their indices
+    feature_indices = {feature: i for i, feature in enumerate(df.columns)}
+
+    # Validate selected features
+    missing_features = [feature for feature in selected_features if feature not in df.columns]
+    if missing_features:
+        raise ValueError(f"Some selected features are not in the DataFrame columns: {missing_features}")
+
+    # Extract indices for the selected features
+    selected_indices = [
+        range(feature_indices[feature] * n, (feature_indices[feature] + 1) * n)
+        for feature in selected_features
+    ]
+    selected_indices = [idx for sublist in selected_indices for idx in sublist]
+
+    # Extract embeddings for selected indices
+    selected_embeddings = embeddings[:, selected_indices]
+
+    # Save the selected embeddings
+    with open(save_path, 'wb') as f:
+        pickle.dump(selected_embeddings, f)
+
+    # Create column names dynamically for flattened vectors
+    flat_column_names = [
+        f"{feature}_dim{dim}"
+        for feature in selected_features
+        for dim in range(n)
+    ]
+
+    # Create a DataFrame for flattened embeddings
+    selected_embeddings_df = pd.DataFrame(selected_embeddings, columns=flat_column_names)
+
+    # Add original vectors for each feature
+    for feature in selected_features:
+        feature_start_idx = feature_indices[feature] * n
+        feature_end_idx = feature_start_idx + n
+        selected_embeddings_df[f"{feature}_vector"] = list(embeddings[:, feature_start_idx:feature_end_idx])
+
+    return selected_embeddings_df
+
+
+def reorder_columns(df: pd.DataFrame, col_dict: dict) -> pd.DataFrame:
+    """
+    Reorders DataFrame columns based on the provided column dictionary.
+    
+    Args:
+        df (pd.DataFrame): DataFrame to reorder.
+        col_dict (dict): Dictionary defining column groups and their order.
+    
+    Returns:
+        pd.DataFrame: Reordered DataFrame.
+    """
+    ordered_columns = [col for key in col_dict for col in col_dict[key]]
+    return df[ordered_columns]
+
+Integration Details
+
+    DimensionalityReducer:
+        This is applied after generating embeddings to reduce the dimensionality to a desired size (e.g., 32 or 64) with dropout and normalization.
+
+    get_embeddings_from_dataframe:
+        The embeddings are generated using the model, passed through the reducer, and normalized before returning.
+
+    get_feature_embeddings:
+        This extracts embeddings for specific features from the reduced embeddings and saves the results to a file.
+
+    reorder_columns:
+        Maintains column alignment in the DataFrame if required by downstream tasks.
+
+Example Usage
+Step 1: Generate Embeddings with Dimensionality Reduction
+
+# Mock DataFrame and tensor
+df = pd.DataFrame({
+    'UserName': ['Alice', 'Bob', 'Charlie'],
+    'InterestRate': [3.5, 4.2, 5.1],
+    'LoanPurpose': ['Home', 'Car', 'Education'],
+    'DueDate': ['2023-01-01', '2023-02-15', '2023-03-10'],
+})
+tf = torch.randn(3, 768)  # Mock tensor (batch_size=3, input_dim=768)
+
+# Initialize model and reducer
+model = TabularNN(channels=128, out_channels=64, num_layers=2, col_stats={}, col_names_dict={})
+reducer = DimensionalityReducer(input_dim=768, reduced_dim=64, dropout_prob=0.2)
+
+# Device setup
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Generate reduced embeddings
+embeddings = get_embeddings_from_dataframe(df, tf, model, reducer, format="get_pd", device=device)
+print(embeddings)
+
+Step 2: Extract Specific Feature Embeddings
+
+selected_features = ['UserName', 'InterestRate']
+save_path = "selected_feature_embeddings.pkl"
+selected_embeddings_df = get_feature_embeddings(df, embeddings.to_numpy(), selected_features, n=64, save_path=save_path)
+print(selected_embeddings_df)
+
+Step 3: Reorder Columns
+
+col_dict = {'group1': ['UserName'], 'group2': ['InterestRate', 'LoanPurpose']}
+reordered_df = reorder_columns(df, col_dict)
+print(reordered_df)
+
+Next Steps
+
+    Do you want help benchmarking this pipeline for a real-world dataset?
+    Should we add visualization or clustering for the reduced embeddings?
+
+You said:
+Do the following:
+- add to TabularNN options to extract/save 
+  - embeddings (without convolution layers applied)
+--convoluted embeddings (after the convolution layers are applied)
+- pooled embeddings (after pooling, one vector per row)
+
+Also Show me visualization and clustering. Use UMAP and HDBSCAN
+ChatGPT said:
+GPT Icon
+
+Below is the implementation of the requested features:
+
+    Updates to TabularNN:
+        Add options to extract/save:
+            Raw embeddings (directly from the encoder).
+            Convoluted embeddings (after applying convolution layers).
+            Pooled embeddings (after pooling to row-level embeddings).
+
+    Visualization and clustering:
+        Use UMAP for dimensionality reduction to 2D/3D.
+        Use HDBSCAN for clustering in the reduced space.
+
+Updated TabularNN with Embedding Options
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TabularNN(nn.Module):
+    """
+    TabularNN model with options to extract raw, convoluted, and pooled embeddings.
+    
+    Args:
+        channels (int): Input/hidden channel dimensionality.
+        out_channels (int): Output dimensionality.
+        num_layers (int): Number of convolution layers.
+        col_stats (dict): Column statistics for feature encoders.
+        col_names_dict (dict): Column names grouped by feature types.
+    """
+    def __init__(
+        self,
+        channels: int,
+        out_channels: int,
+        num_layers: int,
+        col_stats: dict,
+        col_names_dict: dict,
+    ):
+        super().__init__()
+        self.encoder = StypeWiseFeatureEncoder(
+            out_channels=channels,
+            col_stats=col_stats,
+            col_names_dict=col_names_dict,
+            stype_encoder_dict={
+                stype.categorical: EmbeddingEncoder(),
+                stype.numerical: LinearEncoder(),
+                text_stype.parent: LinearEmbeddingEncoder(),
+                stype.timestamp: TimestampEncoder(),
+            },
+        )
+        self.convs = nn.ModuleList([SelfAttentionConv(channels) for _ in range(num_layers)])
+        self.decoder = MeanDecoder(channels, out_channels)
+
+    def forward(self, tf: torch.Tensor, return_type: str = "pooled"):
+        """
+        Forward pass with options to extract different embedding types.
+        
+        Args:
+            tf (torch.Tensor): TensorFrame input.
+            return_type (str): Type of embedding to return:
+                - 'raw': Raw embeddings from the encoder.
+                - 'convoluted': Embeddings after convolution layers.
+                - 'pooled': Pooled embeddings after mean pooling.
+        
+        Returns:
+            torch.Tensor: Embeddings of the specified type.
+        """
+        raw_embeddings, _ = self.encoder(tf)  # Raw embeddings [batch_size, num_cols, channels]
+        
+        if return_type == "raw":
+            return raw_embeddings
+        
+        x = raw_embeddings
+        for conv in self.convs:
+            x = conv(x)  # Convoluted embeddings
+        
+        if return_type == "convoluted":
+            return x
+        
+        pooled_embeddings = self.decoder(x)  # Pooled embeddings
+        return pooled_embeddings
+
+UMAP and HDBSCAN Visualization and Clustering
+
+import umap
+import hdbscan
+import matplotlib.pyplot as plt
+import pandas as pd
+
+def visualize_and_cluster(embeddings: torch.Tensor, labels=None, n_neighbors=15, min_cluster_size=10):
+    """
+    Visualizes embeddings using UMAP and clusters them using HDBSCAN.
+    
+    Args:
+        embeddings (torch.Tensor): Embeddings to reduce and cluster.
+        labels (list or np.array, optional): Labels for coloring in visualization.
+        n_neighbors (int): UMAP parameter for local neighborhood size.
+        min_cluster_size (int): HDBSCAN parameter for the smallest cluster size.
+    
+    Returns:
+        hdbscan.HDBSCAN: Trained HDBSCAN model.
+    """
+    # Convert embeddings to NumPy for UMAP and HDBSCAN
+    embeddings_np = embeddings.detach().cpu().numpy()
+    
+    # Dimensionality reduction with UMAP
+    reducer = umap.UMAP(n_neighbors=n_neighbors, min_dist=0.1, n_components=2, random_state=42)
+    reduced_embeddings = reducer.fit_transform(embeddings_np)
+    
+    # Clustering with HDBSCAN
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size, gen_min_span_tree=True)
+    cluster_labels = clusterer.fit_predict(reduced_embeddings)
+    
+    # Visualization
+    plt.figure(figsize=(10, 8))
+    plt.scatter(reduced_embeddings[:, 0], reduced_embeddings[:, 1], c=cluster_labels, cmap='Spectral', s=10)
+    plt.colorbar(label='Cluster Label')
+    plt.title('UMAP Projection with HDBSCAN Clustering')
+    plt.xlabel('UMAP Dimension 1')
+    plt.ylabel('UMAP Dimension 2')
+    plt.show()
+
+    return clusterer
+
+# Example Usage
+# Assuming embeddings (torch.Tensor) is from the TabularNN model
+embeddings = torch.randn(100, 128)  # Mock 128-d embeddings for 100 samples
+clusterer = visualize_and_cluster(embeddings, n_neighbors=15, min_cluster_size=10)
+
+Example Workflow
+
+    Generate Embeddings: Extract desired embeddings (raw, convoluted, or pooled) from TabularNN.
+
+# Assuming TabularNN is initialized as `model` and `tf` is the input TensorFrame
+raw_embeddings = model(tf, return_type="raw")
+convoluted_embeddings = model(tf, return_type="convoluted")
+pooled_embeddings = model(tf, return_type="pooled")
+
+    Visualize and Cluster: Apply UMAP and HDBSCAN on the desired embeddings.
+
+# Visualize and cluster the pooled embeddings
+clusterer = visualize_and_cluster(pooled_embeddings, n_neighbors=15, min_cluster_size=5)
+
+Outputs
+
+    UMAP Visualization: A scatter plot with points colored by their HDBSCAN cluster labels.
+
+    HDBSCAN Clustering:
+        clusterer.labels_: Cluster labels for each point.
+        clusterer.probabilities_: Cluster membership probabilities.
+
+
+
+
+import pickle
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class DimensionalityReducer(nn.Module):
+    """
+    Dimensionality reduction with a linear projection layer and dropout regularization.
+    
+    Args:
+        input_dim (int): Dimension of the input embeddings.
+        reduced_dim (int): Dimension to reduce the embeddings to.
+        dropout_prob (float): Probability of dropping out neurons during training.
+    """
+    def __init__(self, input_dim, reduced_dim, dropout_prob=0.1):
+        super().__init__()
+        self.projection = nn.Linear(input_dim, reduced_dim)
+        self.dropout = nn.Dropout(p=dropout_prob)
+
+    def forward(self, x):
+        x = self.projection(x)
+        x = self.dropout(x)
+        return x
+
+
+def get_feature_embeddings_with_reduction(
+    df: pd.DataFrame,
+    embeddings: np.ndarray,
+    selected_features: list,
+    n: int,
+    reducer: DimensionalityReducer,
+    save_path: str,
+    device: torch.device,
+) -> pd.DataFrame:
+    """
+    Extracts specific feature embeddings from a NumPy array, applies dimensionality reduction, saves them to a file,
+    and returns a DataFrame.
+
+    Args:
+        df (pd.DataFrame): DataFrame with column names aligned with embeddings.
+        embeddings (np.ndarray): Array of shape (rows, columns * channels), where embeddings are flattened.
+        selected_features (list): List of feature names to extract.
+        n (int): Number of channels (dimensions) per feature.
+        reducer (DimensionalityReducer): Dimensionality reducer model.
+        save_path (str): Path to save the embeddings as a pickle file.
+        device (torch.device): Device to run the reducer on (CPU or GPU).
+
+    Returns:
+        pd.DataFrame: DataFrame containing reduced embeddings and original vectors for the selected features.
+    """
+    # Map feature names to their indices
+    feature_indices = {feature: i for i, feature in enumerate(df.columns)}
+
+    # Validate selected features
+    missing_features = [feature for feature in selected_features if feature not in df.columns]
+    if missing_features:
+        raise ValueError(f"Some selected features are not in the DataFrame columns: {missing_features}")
+
+    # Extract indices for the selected features
+    selected_indices = [
+        range(feature_indices[feature] * n, (feature_indices[feature] + 1) * n)
+        for feature in selected_features
+    ]
+    selected_indices = [idx for sublist in selected_indices for idx in sublist]
+
+    # Extract embeddings for the selected indices
+    selected_embeddings = embeddings[:, selected_indices]  # Shape: (rows, len(selected_features) * n)
+
+    # Convert to PyTorch tensor for dimensionality reduction
+    selected_embeddings_tensor = torch.tensor(selected_embeddings, dtype=torch.float32, device=device)
+
+    # Apply dimensionality reduction
+    reducer.eval()
+    with torch.no_grad():
+        reduced_embeddings = reducer(selected_embeddings_tensor).cpu().numpy()
+
+    # Save reduced embeddings to a pickle file
+    with open(save_path, 'wb') as f:
+        pickle.dump(reduced_embeddings, f)
+
+    # Create column names dynamically for reduced embeddings
+    reduced_dim = reduced_embeddings.shape[1]
+    reduced_column_names = [
+        f"{feature}_reduced_dim{dim}"
+        for feature in selected_features
+        for dim in range(reduced_dim // len(selected_features))
+    ]
+
+    # Create a DataFrame for reduced embeddings
+    reduced_embeddings_df = pd.DataFrame(reduced_embeddings, columns=reduced_column_names)
+
+    # Add a column for each feature with its original embedding vector
+    for feature in selected_features:
+        feature_start_idx = feature_indices[feature] * n
+        feature_end_idx = feature_start_idx + n
+        reduced_embeddings_df[f"{feature}_original_vector"] = list(
+            embeddings[:, feature_start_idx:feature_end_idx]
+        )
+
+    return reduced_embeddings_df
+
+
+
