@@ -1,132 +1,74 @@
-# file: bigquery_utils.py
-from google.cloud import bigquery
-import pandas as pd
-import logging
 
-# Configure logging
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+
+
+# Import libraries
+
+from typing import Any, List, Optional
+
+import pandas as pd
+import numpy as np
+import math
+
+from tqdm import tqdm
+
+from torch import Tensor
+from torch.nn import Linear, Module, ModuleList
+
+import torch_frame
+from torch_frame import stype, TensorFrame
+from torch_frame import numerical, categorical, text_embedded, embedding, timestamp
+from torch_frame.data import Dataset, DataLoader
+from torch_frame.data.stats import StatType
+from torch_frame.nn.conv import TabTransformerConv
+from torch_frame.nn.encoder import (
+    EmbeddingEncoder,
+    LinearEmbeddingEncoder,
+    LinearEncoder,
+    StypeWiseFeatureEncoder,
 )
-logger = logging.getLogger(__name__)
-
-def initialize_bigquery_client(project_id=None):
-    """
-    Initialize the BigQuery client.
-    Args:
-        project_id (str): GCP Project ID.
-    Returns:
-        bigquery.Client: BigQuery client object.
-    """
-    try:
-        client = bigquery.Client(project=project_id)
-        logger.info(f"BigQuery client initialized with project: {client.project}")
-        return client
-    except Exception as e:
-        raise ValueError(f"Failed to initialize BigQuery client: {e}")
-
-def read_table(client, dataset_id, table_id, mode='all', sample_size=None):
-    """
-    Read a BigQuery table into a pandas DataFrame.
-    Args:
-        client (bigquery.Client): Initialized BigQuery client.
-        dataset_id (str): Dataset ID.
-        table_id (str): Table ID.
-        mode (str): 'all' for full data, 'sample' for limited rows.
-        sample_size (int): Number of rows to sample.
-    Returns:
-        pd.DataFrame: DataFrame with table data.
-    """
-    if not dataset_id or not table_id:
-        raise ValueError("Both dataset_id and table_id must be provided.")
-    
-    table_ref = f"{client.project}.{dataset_id}.{table_id}"
-    query = f"SELECT * FROM `{table_ref}`"
-    if mode == 'sample' and sample_size:
-        query += f" LIMIT {sample_size}"
-    
-    logger.info(f"Executing query: {query}")
-    try:
-        dataframe = client.query(query).to_dataframe()
-        logger.info(f"Loaded {dataframe.shape[0]} rows from {table_ref}.")
-        return dataframe
-    except Exception as e:
-        raise ValueError(f"Failed to query table {table_ref}: {e}")
-
-def read_table_in_batches(client, dataset_id, table_id, batch_size=10000):
-    """
-    Read a BigQuery table in batches.
-    Args:
-        client (bigquery.Client): Initialized BigQuery client.
-        dataset_id (str): Dataset ID.
-        table_id (str): Table ID.
-        batch_size (int): Number of rows per batch.
-    Yields:
-        pd.DataFrame: DataFrame batch.
-    """
-    table_ref = f"{client.project}.{dataset_id}.{table_id}"
-    query = f"SELECT * FROM `{table_ref}`"
-    logger.info(f"Fetching total row count for {table_ref}.")
-    
-    total_rows = client.query(query).result().total_rows
-    logger.info(f"Table {table_ref} contains {total_rows} rows.")
-    
-    for start_index in range(0, total_rows, batch_size):
-        batch_query = f"{query} LIMIT {batch_size} OFFSET {start_index}"
-        logger.info(f"Fetching rows {start_index} to {start_index + batch_size - 1}.")
-        try:
-            yield client.query(batch_query).to_dataframe()
-        except Exception as e:
-            logger.error(f"Failed to fetch batch starting at {start_index}: {e}")
-            raise ValueError(f"Batch fetch error: {e}")
-
-# file: file_utils.py
-import pandas as pd
-import pickle
-import json
-import os
-
-def read_file(file_path):
-    """
-    Read a file into a pandas DataFrame.
-    Args:
-        file_path (str): Path to the file.
-    Returns:
-        pd.DataFrame: DataFrame with file data.
-    """
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext == ".txt" or ext == ".csv":
-        return pd.read_csv(file_path)
-    elif ext == ".xlsx":
-        return pd.read_excel(file_path)
-    elif ext == ".json":
-        with open(file_path, 'r') as f:
-            return pd.DataFrame(json.load(f))
-    elif ext == ".pkl":
-        with open(file_path, "rb") as f:
-            return pd.DataFrame(pickle.load(f))
-    else:
-        raise ValueError(f"Unsupported file extension: {ext}")
-
-def save_dataframe(df, file_path):
-    """
-    Save a DataFrame to a file.
-    Args:
-        df (pd.DataFrame): DataFrame to save.
-        file_path (str): Path to save the file.
-    """
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext in [".csv", ".txt"]:
-        df.to_csv(file_path, index=False)
-    elif ext == ".json":
-        df.to_json(file_path, orient='records')
-    elif ext == ".pkl":
-        with open(file_path, "wb") as f:
-            pickle.dump(df.to_dict(), f, protocol=pickle.HIGHEST_PROTOCOL)
-    else:
-        raise ValueError(f"Unsupported file extension: {ext}")
+from torch_frame.nn.decoder import Decoder
+from torch_frame.nn.encoder.stype_encoder import TimestampEncoder
+from torch_frame.config.text_embedder import TextEmbedderConfig
 
 
+class TransformerEmbed(Module):
+    def __init__(
+        self,
+        channels, out_channels, num_layers, num_heads,
+        col_stats, col_names_dict,
+    ):
+        super().__init__()
+
+        # Specify what feature encoder to use for each stype.
+        stype_encoder_dict = {
+            stype.categorical: EmbeddingEncoder(),
+            stype.numerical: LinearEncoder(), 
+            text_stype.parent: LinearEmbeddingEncoder(),
+            stype.timestamp: TimestampEncoder()
+        }
+
+        self.encoder = StypeWiseFeatureEncoder(
+            out_channels=channels,
+            col_stats=col_stats,
+            col_names_dict=col_names_dict,
+            # Specify what feature encoder to use for each stype.
+            stype_encoder_dict = stype_encoder_dict,
+        )
+        self.convs = ModuleList([
+            TabTransformerConv(
+                channels=channels,
+                num_heads=num_heads,
+            ) for _ in range(num_layers)
+        ])
+
+        self.decoder = Linear(channels, out_channels)
+
+    def forward(self, tf: TensorFrame) -> Tensor:
+        x, _ = self.encoder(tf)
+        for conv in self.convs:
+            x = conv(x)
+        out = self.decoder(x.mean(dim=1))
+        return out
 
 ============================================================================================================
 
