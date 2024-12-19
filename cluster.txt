@@ -1,0 +1,348 @@
+import yaml
+from umap import UMAP
+from hdbscan import validity_index
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
+from sklearn.cluster import KMeans, DBSCAN, Birch
+from sklearn.mixture import GaussianMixture
+from sklearn_som.som import SOM
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
+class Clusterer:
+    def __init__(self, technique='kmeans', config_file=None):
+        """
+        Initialize the Clusterer with a YAML configuration file.
+
+        Args:
+            technique (str): Clustering technique to use.
+            config_file (str): Path to the YAML configuration file.
+        """
+        self.techniques = ['kmeans', 'som', 'dbscan', 'hdbscan', 'birch', 'gaussianmixture', 'gaussian mixture']
+        self.technique = technique.lower()
+        if self.technique not in self.techniques:
+            raise ValueError(f"Invalid technique. Choose from {self.techniques}.")
+        
+        # Load configuration
+        self.config = self._load_config(config_file) if config_file else {}
+        self.kwargs = self.config.get(self.technique, {})
+        self.umap_kwargs = self.config.get('umap', {})
+    
+    def _load_config(self, config_file):
+        """Load configuration from a YAML file."""
+        try:
+            with open(config_file, 'r') as file:
+                return yaml.safe_load(file)
+        except Exception as e:
+            raise ValueError(f"Error loading YAML file: {e}")
+    
+    def fit(self, data, use_umap=False):
+        """
+        Fit the clustering model.
+
+        Args:
+            data: Input data for clustering.
+            use_umap (bool): Whether to apply UMAP before clustering.
+        """
+        data = self._convert_df(data)
+        
+        if use_umap:
+            # Apply UMAP for dimensionality reduction
+            reducer = UMAP(**self.umap_kwargs)
+            data = reducer.fit_transform(data)
+        
+        self.clusterer = self._get_clusterer(data, self.kwargs)
+        self.labels = self._get_labels(data, self.clusterer)
+        self.scores = self._get_scores(data, self.labels, self.clusterer)
+        self.dfc = self._add_cluster_column(data, self.labels)
+    
+    def _convert_df(self, df):
+        """Convert data to numpy array."""
+        if isinstance(df, pd.DataFrame):
+            return df.values
+        elif isinstance(df, pd.Series):
+            return np.stack(df.values)
+        elif isinstance(df, np.ndarray):
+            return df
+        else:
+            raise ValueError("Input data must be a DataFrame, Series, or ndarray.")
+    
+    def _get_clusterer(self, data, kwargs):
+        """Initialize and fit the clusterer."""
+        if self.technique == 'kmeans':
+            return KMeans(**kwargs).fit(data)
+        elif self.technique == 'dbscan':
+            return DBSCAN(**kwargs).fit(data)
+        elif self.technique == 'hdbscan':
+            return hdbscan.HDBSCAN(**kwargs).fit(data)
+        elif self.technique == 'som':
+            return SOM(**kwargs).fit(data)
+        elif self.technique == 'birch':
+            return Birch(**kwargs).fit(data)
+        elif self.technique in ['gaussianmixture', 'gaussian mixture']:
+            return GaussianMixture(**kwargs).fit(data)
+        else:
+            raise ValueError("Invalid clustering technique.")
+    
+    def _get_labels(self, data, clusterer):
+        """Retrieve labels."""
+        if self.technique in ['kmeans', 'dbscan', 'hdbscan', 'birch']:
+            return clusterer.labels_
+        elif self.technique in ['gaussianmixture', 'gaussian mixture']:
+            return clusterer.predict(data)
+        elif self.technique == 'som':
+            return clusterer.predict(data)
+        else:
+            raise ValueError("Invalid clustering technique.")
+    
+    def _get_scores(self, data, labels, clusterer):
+        """Calculate clustering scores."""
+        scores = {}
+        try:
+            scores['silhouette'] = silhouette_score(data, labels) if len(set(labels)) > 1 else -1
+            scores['calinski_harabasz'] = calinski_harabasz_score(data, labels) if len(set(labels)) > 1 else -1
+            scores['davies_bouldin'] = davies_bouldin_score(data, labels) if len(set(labels)) > 1 else -1
+            if self.technique == 'hdbscan' and hasattr(clusterer, 'outlier_scores_'):
+                scores['dbcv'] = validity_index(data, labels)
+        except ValueError as e:
+            print(f"Error in computing scores: {e}")
+        return scores
+    
+    def _add_cluster_column(self, data, labels):
+        """Add cluster numbers as a new column in a DataFrame."""
+        df = pd.DataFrame(data, columns=[f'Feature_{i}' for i in range(data.shape[1])])
+        df['Cluster'] = labels
+        return df
+    
+    def make_plot(self, data, labels=None, reduced_data=None):
+        """Visualize clusters in 2D."""
+        labels = labels or self.labels
+        if reduced_data is None:
+            # Default to UMAP if no reduced data is provided
+            reducer = UMAP(**self.umap_kwargs)
+            reduced_data = reducer.fit_transform(data)
+        
+        plt.figure(figsize=(10, 6))
+        sns.scatterplot(x=reduced_data[:, 0], y=reduced_data[:, 1], hue=labels, palette='Set2', s=50)
+        plt.title(f"Clusters Visualized - {self.technique.capitalize()}")
+        plt.xlabel('Component 1')
+        plt.ylabel('Component 2')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.show()
+
+
+=================================================================================
+
+kmeans:
+  n_clusters: 4
+  init: "k-means++"
+  n_init: 10
+  max_iter: 300
+
+hdbscan:
+  min_cluster_size: 10
+  metric: "euclidean"
+  cluster_selection_method: "eom"
+  prediction_data: true
+
+umap:
+  n_neighbors: 15
+  n_components: 2
+  metric: "euclidean"
+
+
+==================================================================
+
+
+
+# Example usage
+clusterer = Clusterer(technique='hdbscan', config_file='config.yaml')
+
+# Fit with UMAP
+clusterer.fit(data, use_umap=True)
+
+# View scores
+print(clusterer.scores)
+
+# Plot
+clusterer.make_plot(data)
+
+# View DataFrame with cluster column
+print(clusterer.dfc.head())
+
+
+========================================================================
+
+
+import pickle
+import hdbscan
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
+import umap.umap_ as umap
+import seaborn as sns
+
+
+class HdbscanClusterer:
+    def __init__(self,
+                 min_cluster_size=20,
+                 min_samples=1,
+                 metric='euclidean',
+                 cluster_selection_method='leaf'):
+        """
+        Initialize the HDBSCAN Clusterer with default parameters.
+        """
+        self.clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            metric=metric,
+            cluster_selection_method=cluster_selection_method,
+            prediction_data=True
+        )
+
+    def fit(self, embeddings, save_path=None):
+        """
+        Fit the HDBSCAN model to the provided embeddings.
+
+        Args:
+            embeddings (list or np.ndarray): Input embeddings for clustering.
+            save_path (str, optional): Path to save the fitted model (pickle).
+        """
+        embeddings = self._validate_embeddings(embeddings)
+        self.clusterer.fit(embeddings)
+        self.labels_ = self.clusterer.labels_
+        self.probabilities_ = self.clusterer.probabilities_
+
+        if save_path:
+            with open(save_path, 'wb') as f:
+                pickle.dump(self.clusterer, f)
+
+    def compute_scores(self, embeddings, labels, mood):
+        """
+        Compute clustering evaluation scores.
+        """
+        embeddings = self._validate_embeddings(embeddings)
+        print(f"Clustering evaluation scores for {mood}:")
+        try:
+            print("Silhouette Score:", silhouette_score(embeddings, labels))
+            print("Davies-Bouldin Score:", davies_bouldin_score(embeddings, labels))
+            print("Calinski-Harabasz Score:", calinski_harabasz_score(embeddings, labels))
+        except ValueError as e:
+            print("Error computing scores:", e)
+
+    def add_labels(self, df, embeddings_column):
+        """
+        Add clustering labels and probabilities to the DataFrame.
+        """
+        if not hasattr(self, 'labels_') or not hasattr(self, 'probabilities_'):
+            raise RuntimeError("Model must be fitted before adding labels.")
+        
+        embeddings = self._validate_embeddings(df[embeddings_column].tolist())
+        df['hard_labels'] = self.labels_
+        df['label_probab'] = self.probabilities_
+
+        # Compute soft cluster membership
+        soft_clusters = hdbscan.all_points_membership_vectors(self.clusterer)
+        df['soft_labels'] = [np.argmax(row) for row in soft_clusters]
+        return df
+
+    def visualize_2D_clusters(self, embeddings, mood, title="2D Cluster Visualization"):
+        """
+        Visualize clusters in 2D using UMAP dimensionality reduction.
+        """
+        embeddings = self._validate_embeddings(embeddings)
+        umap_data = umap.UMAP(n_neighbors=15, n_components=2, metric='cosine').fit_transform(embeddings)
+        result = pd.DataFrame(umap_data, columns=['x', 'y'])
+        result['labels'] = self.labels_
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        sns.scatterplot(data=result, x='x', y='y', hue='labels', palette='viridis', s=20, ax=ax)
+        ax.set_title(f"{title} - {mood}")
+        ax.legend(title="Clusters", bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.show()
+
+    def plot_tree(self):
+        """
+        Plot the condensed tree for the fitted HDBSCAN model.
+        """
+        if not hasattr(self.clusterer, 'condensed_tree_'):
+            raise RuntimeError("Model must be fitted before plotting the tree.")
+        
+        plt.figure(figsize=(10, 6))
+        self.clusterer.condensed_tree_.plot(select_clusters=True)
+        plt.title("Condensed Cluster Tree")
+        plt.show()
+
+    def evaluate_persistence(self):
+        """
+        Evaluate cluster persistence scores (ignoring noise cluster).
+        """
+        if not hasattr(self.clusterer, 'cluster_persistence_'):
+            raise RuntimeError("Model must be fitted to evaluate persistence.")
+        
+        persistence_df = pd.DataFrame({'Cluster': np.arange(len(self.clusterer.cluster_persistence_)),
+                                       'Persistence': self.clusterer.cluster_persistence_})
+        return persistence_df[persistence_df['Cluster'] != -1].sort_values(by='Persistence', ascending=False)
+
+    def clusters_bar_chart(self, labels, title="Cluster Distribution"):
+        """
+        Plot a bar chart of the cluster label distribution.
+        """
+        label_counts = pd.Series(labels).value_counts()
+        label_counts = label_counts[label_counts.index != -1]  # Exclude noise
+        
+        fig, ax = plt.subplots(figsize=(8, 4))
+        sns.barplot(x=label_counts.index, y=label_counts.values, palette="viridis", ax=ax)
+        ax.set_title(title)
+        ax.set_xlabel("Cluster Label")
+        ax.set_ylabel("Count")
+        for container in ax.containers:
+            ax.bar_label(container, fmt='%d')
+        plt.show()
+
+    def _validate_embeddings(self, embeddings):
+        """
+        Validate and ensure embeddings are in the correct format.
+        """
+        if isinstance(embeddings, pd.Series):
+            embeddings = embeddings.tolist()
+        if isinstance(embeddings, list):
+            embeddings = np.array(embeddings)
+        if not isinstance(embeddings, np.ndarray):
+            raise ValueError("Embeddings must be a list, pandas Series, or numpy array.")
+        return embeddings
+
+
+========================================================================
+
+# Initialize
+clusterer = HdbscanClusterer(min_cluster_size=15, metric='euclidean')
+
+# Fit model
+clusterer.fit(embeddings, save_path="hdbscan_model.pkl")
+
+# Add labels
+df = clusterer.add_labels(df, embeddings_column='768_embedding')
+
+# Compute scores
+clusterer.compute_scores(df['768_embedding'].tolist(), clusterer.labels_, mood="example")
+
+# Visualize clusters
+clusterer.visualize_2D_clusters(df['768_embedding'].tolist(), mood="example")
+
+# Plot tree
+clusterer.plot_tree()
+
+# Evaluate persistence
+print(clusterer.evaluate_persistence())
+
+# Bar chart of clusters
+clusterer.clusters_bar_chart(clusterer.labels_)
+
+
+
+
+
