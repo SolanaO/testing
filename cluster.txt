@@ -1,3 +1,87 @@
+
+def handle_nan_and_zero_values(
+        self,
+        df: pd.DataFrame,
+        threshold: float,
+        drop_columns: bool = True,
+        fill_numerical: bool = True,
+        column_replacement_dict: dict = None,
+        target_columns: list = None
+    ) -> pd.DataFrame:
+    """
+    Handles NaN and zero values in DataFrame by computing their percentage per column,
+    optionally dropping columns exceeding a threshold, and optionally filling NaNs and
+    zeros based on customizable strategy for each column. Tracks changes in separate 'orig' columns.
+    
+    Args:
+        df (pd.DataFrame): The input DataFrame.
+        threshold (float): Proportion threshold for combined NaN and zero values to
+                           identify columns for potential removal.
+        drop_columns (bool): Whether to drop columns with combined NaN and zero 
+                             percentage exceeding the threshold.
+        fill_numerical (bool): Whether to handle NaN and zero values in numerical columns.
+        column_replacement_dict (dict): Dictionary specifying replacement strategy for 
+                                        individual columns. Format: {column_name:
+                                        {"strategy": "mean|zero|value", "value": custom_value}}.
+        target_columns (list): List of specific columns to apply the replacement. 
+                               Defaults to numerical columns.
+    
+    Returns:
+        pd.DataFrame: DataFrame with NaNs and zeros handled and changes tracked in 'orig' columns.
+    """
+    # Determine the target columns (numerical or user-specified)
+    if target_columns is None:
+        target_columns = df.select_dtypes(include=[np.number]).columns
+    else:
+        target_columns = [col for col in target_columns if col in df.columns]
+    
+    # Compute the combined percentage of NaN and zero values in each column
+    combined_nan_zero_percentage = (df[target_columns].isna().sum() + (df[target_columns] == 0).sum()) / len(df)
+    self.logger.info(f"Combined NaN and zero percentages per column:\n{combined_nan_zero_percentage}")
+    
+    # Drop columns exceeding the combined threshold
+    columns_to_drop = []
+    if drop_columns:
+        columns_to_drop = combined_nan_zero_percentage[combined_nan_zero_percentage > threshold].index
+        self.logger.info(f"Dropping columns with > {threshold * 100}% combined NaN and zero values: {list(columns_to_drop)}")
+        df = df.drop(columns=columns_to_drop, errors="ignore")
+    
+    # Exclude columns_to_drop from target columns
+    target_columns = [col for col in target_columns if col not in columns_to_drop]
+    
+    # Handle NaNs and zeros in target columns based on the replace strategy
+    if fill_numerical and column_replacement_dict:
+        for col in target_columns:
+            if col in column_replacement_dict.keys():
+                strategy = column_replacement_dict[col].get("strategy", "median")
+                value = column_replacement_dict[col].get("value", None)
+                nan_zero_mask = df[col].isna() | (df[col] == 0)
+                
+                # Add an 'orig' column to track changes
+                orig_col_name = f"{col}_orig"
+                if orig_col_name not in df.columns:
+                    df[orig_col_name] = False  # Default: no changes
+                
+                # Apply replacement if necessary
+                if nan_zero_mask.any():
+                    if strategy == "mean":
+                        replacement = df[col].mean()
+                    elif strategy == "median":
+                        replacement = df[col].median()
+                    elif strategy == "value":
+                        replacement = value
+                    elif strategy == "zero":
+                        replacement = 0
+                    else:
+                        raise ValueError(f"Invalid {strategy} for column '{col}'. Use 'mean', 'median', 'zero', or 'value'.")
+                    
+                    self.logger.info(f"Replacing NaN and zero values in column '{col}' with {replacement}.")
+                    df.loc[nan_zero_mask, orig_col_name] = True  # Mark changed rows
+                    df.loc[nan_zero_mask, col] = replacement
+    
+    return df
+
+
 import yaml
 from umap import UMAP
 from hdbscan import validity_index
